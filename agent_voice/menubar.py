@@ -58,7 +58,13 @@ from .runtime import (
     voice_mute_status,
 )
 from .service import daemon_status, service_paths, start_daemon, stop_daemon
-from .usage import UsageStats, format_duration, format_usd, read_usage_stats
+from .usage import (
+    UsageStats,
+    format_duration,
+    format_usd,
+    read_last_voice_channel,
+    read_usage_stats,
+)
 
 
 MENU_BAR_ICON_SIZE = 22.0
@@ -316,6 +322,7 @@ class AgentVoiceMenuBar(NSObject):
         elif voice_active:
             voice_label += " | preparing audio"
         menu.addItem_(self._item(voice_label, enabled=False))
+        self._add_voice_engine_items(menu, config)
         menu.addItem_(NSMenuItem.separatorItem())
 
         self._add_dashboard_items(menu, config)
@@ -337,6 +344,41 @@ class AgentVoiceMenuBar(NSObject):
 
         menu.addItem_(self._item("Quit Menu Bar", "quit:"))
         return menu
+
+    @_python_method
+    def _add_voice_engine_items(self, menu: object, config) -> None:
+        if config.voice_backend == "openai_tts":
+            engine_label = f"Engine: OpenAI TTS · {config.voice_model}"
+        else:
+            engine_label = "Engine: macOS say (local)"
+        if config.voice_name:
+            engine_label += f" ({config.voice_name})"
+        menu.addItem_(self._item(engine_label, enabled=False))
+
+        last_channel = self._read_last_voice_channel(config)
+        if last_channel == "openai_tts":
+            last_label = "Last spoken: OpenAI TTS"
+        elif last_channel == "macos_say":
+            if config.voice_backend == "openai_tts":
+                last_label = "Last spoken: macOS say ⚠️ (OpenAI fell back)"
+            else:
+                last_label = "Last spoken: macOS say"
+        else:
+            last_label = "Last spoken: —"
+        menu.addItem_(self._item(last_label, enabled=False))
+
+        if config.summary_enabled:
+            menu.addItem_(self._item(f"Summary: {config.summary_model}", enabled=False))
+        else:
+            menu.addItem_(self._item("Summary: off (raw last message)", enabled=False))
+
+    @_python_method
+    def _read_last_voice_channel(self, config) -> str | None:
+        try:
+            return read_last_voice_channel(config.database_path)
+        except Exception as exc:
+            self._log(f"Last channel read failed: {exc}")
+            return None
 
     @_python_method
     def _add_dashboard_items(self, menu: object, config) -> None:

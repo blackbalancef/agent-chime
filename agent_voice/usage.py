@@ -64,6 +64,26 @@ def fetch_usage_stats(conn: sqlite3.Connection) -> UsageStats:
     )
 
 
+def read_last_voice_channel(db_path: str | Path) -> str | None:
+    """Return the channel of the most recent voice delivery (openai_tts or macos_say)."""
+    conn = connect(db_path)
+    try:
+        init_db(conn)
+        row = conn.execute(
+            """
+            SELECT channel FROM notifications
+            WHERE channel IN ('openai_tts', 'macos_say')
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return row["channel"] if isinstance(row, sqlite3.Row) else row[0]
+    finally:
+        conn.close()
+
+
 def format_usd(amount: float) -> str:
     if amount <= 0:
         return "$0.0000"
