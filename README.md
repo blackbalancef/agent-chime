@@ -8,7 +8,7 @@
 [![Claude Code](https://img.shields.io/badge/Claude_Code-supported-D97757)](#supported-agents) [![Codex](https://img.shields.io/badge/Codex-supported-111111)](#supported-agents) [![pi agent](https://img.shields.io/badge/pi_agent-supported-6f42c1)](#supported-agents)
 [![Status](https://img.shields.io/badge/status-alpha-orange)](#project-status) [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-[Install](#quick-start) | [Features](#features) | [Supported agents](#supported-agents) | [How it works](#how-it-works) | [Configuration](#configuration)
+[Install](#quick-start) | [Features](#features) | [Menu bar](#menu-bar) | [Supported agents](#supported-agents) | [How it works](#how-it-works) | [Configuration](#configuration)
 
 </div>
 
@@ -20,7 +20,28 @@ Run several agents at once and let Voiccce tell you which project needs attentio
 
 ## Quick start
 
-Install from source, then run the setup wizard:
+The fastest path is the bootstrap installer. It checks for Python 3.12+ and pipx, installs whatever is missing (via Homebrew or a pip fallback), installs Voiccce, and prints the next step:
+
+```bash
+git clone https://github.com/blackbalancef/voiccce.git
+cd voiccce
+./install.sh
+```
+
+Or in one line, without cloning first:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blackbalancef/voiccce/main/install.sh | bash
+```
+
+Then run the setup wizard:
+
+```bash
+voiccce setup both
+```
+
+<details>
+<summary>Prefer manual steps? (you already have pipx)</summary>
 
 ```bash
 git clone https://github.com/blackbalancef/voiccce.git
@@ -28,6 +49,8 @@ cd voiccce
 pipx install --force .
 voiccce setup both
 ```
+
+</details>
 
 No OpenAI API key? Use the built-in macOS voice:
 
@@ -40,7 +63,7 @@ Omit `both` to choose interactively, or pass one target explicitly: `claude-code
 <details>
 <summary>What does setup configure?</summary>
 
-`voiccce setup` configures OpenAI TTS with voice `marin` (or macOS `say` with `--local`), stores your OpenAI key in the macOS Keychain when needed, installs hooks/extensions, starts the daemon, and sends a test notification.
+`voiccce setup` configures OpenAI TTS with voice `marin` (or macOS `say` with `--local`), stores your OpenAI key in the macOS Keychain when needed, installs hooks/extensions, starts the daemon, sends a test notification, and offers to install and start the optional menu bar app.
 
 If Codex was already running, restart the Codex app or `codex app-server`, then open `/hooks` in Codex and trust the Voiccce hooks.
 
@@ -68,6 +91,24 @@ Voiccce is currently alpha. The core workflow is usable, but CLI and configurati
 - Optional menu bar app: quick mute, stop-speaking, daemon, config, log, and spend controls.
 - AI summaries: completed-session updates can be rewritten into concise spoken reports.
 - English and Russian message templates.
+
+## Menu bar
+
+The optional macOS menu bar companion gives quick controls without opening a terminal. `voiccce setup` offers to install and start it for you — or do it manually:
+
+```bash
+pipx inject voiccce pyobjc-framework-Cocoa
+voiccce menubar-start
+```
+
+It shows estimated spend and audio stats, and offers Stop Speaking, Mute 10 min / 1 hour, Unmute, Start/Stop Daemon, Open Config, and Open Daemon Log.
+
+```bash
+voiccce stop-speaking
+voiccce mute --for 10m
+voiccce unmute
+voiccce menubar-stop
+```
 
 ## Supported agents
 
@@ -131,24 +172,6 @@ Use `voiccce setup --local` or `voiccce config --voice-backend macos_say` to run
 </details>
 
 Completed-session events can be rewritten into concise spoken explanations. The default config uses `provider = "openai"` and `model = "gpt-5.4-nano"` when credentials are available. Set `[summary].enabled = false` for template-only messages, or use `privacy_level = "metadata_only"` to summarize the already-short notification text.
-
-## Menu bar
-
-The optional macOS menu bar companion gives quick controls without opening a terminal:
-
-```bash
-pipx inject voiccce pyobjc-framework-Cocoa
-voiccce menubar-start
-```
-
-It shows estimated spend and audio stats, and offers Stop Speaking, Mute 10 min / 1 hour, Unmute, Start/Stop Daemon, Open Config, and Open Daemon Log.
-
-```bash
-voiccce stop-speaking
-voiccce mute --for 10m
-voiccce unmute
-voiccce menubar-stop
-```
 
 ## Useful commands
 

@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -8,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from agent_voice.cli import main
+from agent_voice.cli import _maybe_setup_menubar, _menubar_install_command, main
 from agent_voice.config import load_config, set_voice_config, write_default_config
 from agent_voice.runtime import set_active_voice_sessions
 
@@ -163,6 +164,13 @@ class CliTests(unittest.TestCase):
 
 
 class SetupCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Keep setup tests hermetic: the menu bar step prompts/installs and is
+        # covered separately in SetupMenubarTests.
+        patcher = patch("agent_voice.cli._maybe_setup_menubar")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _fake_claude(self, **kwargs):
         return SimpleNamespace(settings_path=Path("/tmp/settings.json"))
 
@@ -307,6 +315,122 @@ class SetupCommandTests(unittest.TestCase):
                     main(["--config", str(config_path), "setup", "claude-code"])
 
             start.assert_not_called()
+
+
+class SetupMenubarTests(unittest.TestCase):
+    def _config(self) -> SimpleNamespace:
+        return SimpleNamespace(config_path=Path("/tmp/config.toml"))
+
+    def test_choice_false_does_nothing(self) -> None:
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli.start_menubar") as start,
+            patch("agent_voice.cli.subprocess.run") as run,
+            redirect_stdout(StringIO()),
+        ):
+            _maybe_setup_menubar(self._config(), choice=False)
+        start.assert_not_called()
+        run.assert_not_called()
+
+    def test_choice_true_with_cocoa_present_starts_without_install(self) -> None:
+        out = StringIO()
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._cocoa_available", return_value=True),
+            patch("agent_voice.cli.subprocess.run") as run,
+            patch("agent_voice.cli.start_menubar", return_value=999) as start,
+            redirect_stdout(out),
+        ):
+            _maybe_setup_menubar(self._config(), choice=True)
+        run.assert_not_called()
+        start.assert_called_once()
+        self.assertIn("Menu bar started", out.getvalue())
+
+    def test_choice_true_installs_dependency_then_starts(self) -> None:
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._cocoa_available", return_value=False),
+            patch("agent_voice.cli.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+            patch("agent_voice.cli.start_menubar", return_value=1) as start,
+            redirect_stdout(StringIO()),
+        ):
+            _maybe_setup_menubar(self._config(), choice=True)
+        run.assert_called_once()
+        start.assert_called_once()
+
+    def test_choice_true_install_failure_skips_start(self) -> None:
+        out = StringIO()
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._cocoa_available", return_value=False),
+            patch("agent_voice.cli.subprocess.run", return_value=SimpleNamespace(returncode=1)),
+            patch("agent_voice.cli.start_menubar") as start,
+            redirect_stdout(out),
+        ):
+            _maybe_setup_menubar(self._config(), choice=True)
+        start.assert_not_called()
+        self.assertIn("install failed", out.getvalue())
+
+    def test_choice_none_non_tty_skips(self) -> None:
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli.sys.stdin.isatty", return_value=False),
+            patch("agent_voice.cli.start_menubar") as start,
+            redirect_stdout(StringIO()),
+        ):
+            _maybe_setup_menubar(self._config(), choice=None)
+        start.assert_not_called()
+
+    def test_choice_none_tty_default_yes_starts(self) -> None:
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value=""),
+            patch("agent_voice.cli._cocoa_available", return_value=True),
+            patch("agent_voice.cli.start_menubar", return_value=7) as start,
+            redirect_stdout(StringIO()),
+        ):
+            _maybe_setup_menubar(self._config(), choice=None)
+        start.assert_called_once()
+
+    def test_choice_none_tty_no_skips(self) -> None:
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="n"),
+            patch("agent_voice.cli.start_menubar") as start,
+            redirect_stdout(StringIO()),
+        ):
+            _maybe_setup_menubar(self._config(), choice=None)
+        start.assert_not_called()
+
+    def test_non_darwin_skips_even_when_forced(self) -> None:
+        out = StringIO()
+        with (
+            patch("agent_voice.cli.sys.platform", "linux"),
+            patch("agent_voice.cli.start_menubar") as start,
+            redirect_stdout(out),
+        ):
+            _maybe_setup_menubar(self._config(), choice=True)
+        start.assert_not_called()
+        self.assertIn("macOS-only", out.getvalue())
+
+    def test_install_command_prefers_pipx_inject_in_pipx_venv(self) -> None:
+        venv = "/home/u/.local/pipx/venvs/voiccce"
+        with (
+            patch("agent_voice.cli.sys.prefix", venv),
+            patch("agent_voice.cli.shutil.which", return_value="/opt/homebrew/bin/pipx"),
+        ):
+            command = _menubar_install_command()
+        self.assertEqual(command, ["pipx", "inject", "voiccce", "pyobjc-framework-Cocoa"])
+
+    def test_install_command_falls_back_to_pip(self) -> None:
+        with (
+            patch("agent_voice.cli.sys.prefix", "/usr/local"),
+            patch("agent_voice.cli.shutil.which", return_value=None),
+        ):
+            command = _menubar_install_command()
+        self.assertEqual(command, [sys.executable, "-m", "pip", "install", "pyobjc-framework-Cocoa"])
 
 
 if __name__ == "__main__":

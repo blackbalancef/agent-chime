@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import shutil
 import sqlite3
+import subprocess
 import sys
 from collections.abc import Callable
 from datetime import datetime
@@ -93,6 +95,19 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--local", action="store_true", help="Use the local macOS say voice instead of OpenAI TTS (no API key)")
     setup.add_argument("--reset-key", action="store_true", help="Prompt for a new OpenAI key even if one is already configured")
     setup.add_argument("--no-test", action="store_true", help="Skip the test notification at the end")
+    setup.add_argument(
+        "--menubar",
+        dest="menubar",
+        action="store_true",
+        default=None,
+        help="Install and start the macOS menu bar app (prompted if omitted)",
+    )
+    setup.add_argument(
+        "--no-menubar",
+        dest="menubar",
+        action="store_false",
+        help="Skip the macOS menu bar app",
+    )
     setup.add_argument(
         "--claude-config-dir",
         help="Claude config directory, e.g. ~/.claude-personal. Uses <dir>/settings.json.",
@@ -339,6 +354,8 @@ def cmd_setup(args: argparse.Namespace) -> None:
             detail = f" ({error})" if error else ""
             print(f"! Test could not play audio{detail}. Check `voiccce status` and your OpenAI key.")
 
+    _maybe_setup_menubar(config, choice=args.menubar)
+
     print(f"\nDone. Edit {config.config_path} to customize voice, messages, and summaries.")
     if "claude-code" in installed:
         print("Claude Code: if a session was already open, start a new one so it loads the hooks.")
@@ -394,6 +411,63 @@ def _resolve_setup_target(target: str | None) -> str:
     if target not in {"claude-code", "codex", "pi", "both"}:
         raise SystemExit(f"Unknown target '{target}'. Choose claude-code, codex, pi, or both.")
     return target
+
+
+def _cocoa_available() -> bool:
+    try:
+        import AppKit  # noqa: F401  - provided by pyobjc-framework-Cocoa
+    except Exception:
+        return False
+    return True
+
+
+def _menubar_install_command() -> list[str]:
+    prefix = Path(sys.prefix)
+    is_pipx_venv = prefix.parent.name == "venvs" and prefix.parent.parent.name == "pipx"
+    if is_pipx_venv and shutil.which("pipx"):
+        return ["pipx", "inject", prefix.name, "pyobjc-framework-Cocoa"]
+    return [sys.executable, "-m", "pip", "install", "pyobjc-framework-Cocoa"]
+
+
+def _ensure_menubar_dependency() -> bool:
+    if _cocoa_available():
+        return True
+    command = _menubar_install_command()
+    print(f"  Installing menu bar dependency ({' '.join(command)})…")
+    try:
+        completed = subprocess.run(command)
+    except OSError as exc:
+        print(f"! Could not run the installer: {exc}")
+        return False
+    return completed.returncode == 0
+
+
+def _maybe_setup_menubar(config: AgentVoiceConfig, *, choice: bool | None) -> None:
+    if sys.platform != "darwin":
+        if choice:
+            print("! Menu bar app is macOS-only; skipping.")
+        return
+    enable = choice
+    if enable is None:
+        if not sys.stdin.isatty():
+            return
+        answer = input("Enable the macOS menu bar app? [Y/n]: ").strip().lower()
+        enable = answer in {"", "y", "yes"}
+    if not enable:
+        return
+    if not _ensure_menubar_dependency():
+        print(
+            "! Menu bar dependency install failed. Run "
+            "`pipx inject voiccce pyobjc-framework-Cocoa` (or `pip install pyobjc-framework-Cocoa`), "
+            "then `voiccce menubar-start`."
+        )
+        return
+    try:
+        pid = start_menubar(config)
+    except RuntimeError as exc:
+        print(f"! Menu bar could not start: {exc}")
+        return
+    print(f"✓ Menu bar started (pid {pid})")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
