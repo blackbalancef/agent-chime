@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import launchagent, secrets, service
-from .config import AgentVoiceConfig
+from .config import DEFAULT_HOME, AgentVoiceConfig
 from .installer import claude_code, codex, pi, remove_orphaned_wrappers
 
 
@@ -183,7 +183,10 @@ def _teardown_claude(plan: TeardownPlan, report: TeardownReport) -> None:
     result = claude_code.remove_claude_code_personal()
     report.removed_hooks["claude-code"] = list(result.removed_events)
     if plan.restore_backups:
-        restored = claude_code.restore_latest_backup()
+        # Restore the OLDEST backup (the pre-install snapshot), not the newest:
+        # ``remove_claude_code_personal`` above just took a fresh backup of the
+        # still-installed state, so restoring the latest would re-apply Voiccce.
+        restored = claude_code.restore_original_backup()
         if restored is not None:
             report.backups_restored.append(f"claude-code:{restored}")
 
@@ -192,7 +195,10 @@ def _teardown_codex(plan: TeardownPlan, report: TeardownReport) -> None:
     result = codex.remove_codex_personal()
     report.removed_hooks["codex"] = list(result.removed_events)
     if plan.restore_backups:
-        restored = codex.restore_latest_backup()
+        # Restore the OLDEST backup (the pre-install snapshot), not the newest:
+        # ``remove_codex_personal`` above just took a fresh backup of the
+        # still-installed state, so restoring the latest would re-apply Voiccce.
+        restored = codex.restore_original_backup()
         if restored is not None:
             report.backups_restored.append(f"codex:{restored}")
 
@@ -298,16 +304,48 @@ def _read_json(path: Path) -> object:
         return {}
 
 
+VOICCCE_CONFIG_MARKERS = ('api_key_keychain_service = "voiccce"', 'service = "voiccce"')
+
+
 def _is_voiccce_home(home: Path) -> bool:
     """Guard against ``shutil.rmtree`` on an unexpected directory.
 
-    A real Voiccce home is named ``.voiccce`` or holds the telltale files we
-    create (``config.toml``/``events.sqlite3``). The root directory and the
-    user's home are never accepted.
+    Only directories that are unmistakably a Voiccce home are accepted:
+
+    * named exactly ``.voiccce``; or
+    * the configured default home (``config.DEFAULT_HOME``); or
+    * holding BOTH telltale files we create together
+      (``config.toml`` *and* ``events.sqlite3``); or
+    * holding a ``config.toml`` that carries a Voiccce authorship marker.
+
+    A bare ``config.toml`` on its own is *not* enough — it is used by many tools
+    (black/ruff/...), so ``voiccce --config ~/proj/config.toml uninstall --purge``
+    must never be able to ``rmtree`` an unrelated project directory. The
+    filesystem root and the user's home are never accepted.
     """
     home = home.expanduser()
-    if home in (Path(home.anchor), Path.home()):
+    try:
+        home = home.resolve()
+    except OSError:
+        return False
+    if home in (Path(home.anchor), Path.home().resolve()):
         return False
     if home.name == ".voiccce":
         return True
-    return (home / "config.toml").exists() or (home / "events.sqlite3").exists()
+    try:
+        if home == DEFAULT_HOME.expanduser().resolve():
+            return True
+    except OSError:
+        pass
+    config_file = home / "config.toml"
+    if config_file.exists() and (home / "events.sqlite3").exists():
+        return True
+    return _config_has_voiccce_marker(config_file)
+
+
+def _config_has_voiccce_marker(config_file: Path) -> bool:
+    try:
+        text = config_file.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return False
+    return any(marker in text for marker in VOICCCE_CONFIG_MARKERS)

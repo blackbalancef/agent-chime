@@ -284,6 +284,21 @@ class ConfigErrorTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 set_voice_config(config_path, speed=1.0)
 
+    def test_load_config_raises_config_error_on_out_of_range_quiet_hours(self) -> None:
+        # A TOML-valid file with an out-of-range clock time must surface as a
+        # ConfigError (single error contract), not a raw ValueError.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "[quiet_hours]\n"
+                'from = "25:99"\n'
+                'to = "09:00"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ConfigError):
+                load_config(config_path)
+
 
 class MultilineSafeEditorTests(unittest.TestCase):
     def test_editing_voice_preserves_custom_multiline_summary_prompt(self) -> None:
@@ -337,6 +352,71 @@ class MultilineSafeEditorTests(unittest.TestCase):
             data = tomllib.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(data["summary"]["model"], "gpt-4o-mini")
             self.assertIn("old body line", data["summary"]["prompt"])
+
+    def test_editing_voice_with_earlier_triple_quote_substring_value(self) -> None:
+        # An earlier single-line value whose *text* contains ``'''`` must not be
+        # mistaken for the opener of a multi-line block. Editing a later key in the
+        # same section must replace it in place — not lose the edit or duplicate the
+        # key at EOF — and the substring value must be left intact.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "[voice]\n"
+                "enabled = true\n"
+                'instructions = "use \'\'\' for blocks"\n'
+                "rate = 185\n",
+                encoding="utf-8",
+            )
+
+            set_voice_config(config_path, rate=200)
+
+            text = config_path.read_text(encoding="utf-8")
+            data = tomllib.loads(text)
+            self.assertEqual(data["voice"]["rate"], 200)
+            # The triple-quote substring value survives unchanged.
+            self.assertEqual(data["voice"]["instructions"], "use ''' for blocks")
+            # ``rate`` is replaced in place, not duplicated at the end of the file.
+            self.assertEqual(text.count("rate ="), 1)
+
+    def test_setting_triple_quote_instructions_then_editing_another_key(self) -> None:
+        # Storing an instructions value that contains ``'''`` (which sorts BEFORE a
+        # later key in the same section) must not poison the edit of that later key:
+        # the earlier substring value must not open a phantom multi-line block.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "[voice]\n"
+                "enabled = true\n",
+                encoding="utf-8",
+            )
+
+            set_voice_config(config_path, instructions="use ''' for blocks")
+            set_voice_config(config_path, interrupt_on_user_input=False)
+
+            data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["voice"]["instructions"], "use ''' for blocks")
+            self.assertFalse(data["voice"]["interrupt_on_user_input"])
+
+    def test_reset_section_with_earlier_triple_quote_substring_value(self) -> None:
+        # Resetting a section while an EARLIER section holds a value whose text
+        # contains ``'''`` must not swallow the reset target into a phantom block.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "[voice]\n"
+                "enabled = true\n"
+                'instructions = "use \'\'\' for blocks"\n'
+                "\n"
+                "[summary]\n"
+                'model = "gpt-4o-mini"\n',
+                encoding="utf-8",
+            )
+
+            reset_config(config_path, section="summary")
+            config = load_config(config_path)
+
+            self.assertEqual(config.summary_model, "gpt-5.4-nano")
+            self.assertEqual(config.voice_instructions, "use ''' for blocks")
 
 
 class MigrationTests(unittest.TestCase):

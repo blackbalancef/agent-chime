@@ -1285,6 +1285,46 @@ class ClearCommandTests(unittest.TestCase):
             clear_events.assert_not_called()
         self.assertIn("Aborted", out.getvalue())
 
+    def test_clear_all_non_tty_without_yes_refuses(self) -> None:
+        # Irreversible: a non-interactive run (script/pipe/CI/cron) without --yes
+        # must refuse and exit non-zero, never silently wipe data.
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli._interactive", return_value=False),
+                patch("agent_voice.cli.clear_events") as clear_events,
+                patch("agent_voice.cli.clear_notifications") as clear_notifications,
+                patch("agent_voice.cli.clear_session_states") as clear_sessions,
+                redirect_stdout(out),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--config", str(config_path), "clear", "--all"])
+            self.assertEqual(raised.exception.code, 2)
+            clear_events.assert_not_called()
+            clear_notifications.assert_not_called()
+            clear_sessions.assert_not_called()
+        self.assertIn("Refusing", out.getvalue())
+        self.assertIn("--yes", out.getvalue())
+
+    def test_clear_all_non_tty_with_yes_proceeds(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli._interactive", return_value=False),
+                patch("agent_voice.cli.clear_events", return_value=1) as clear_events,
+                patch("agent_voice.cli.clear_notifications", return_value=2),
+                patch("agent_voice.cli.clear_session_states", return_value=4),
+                patch("agent_voice.cli.truncate_pipeline_log"),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "clear", "--all", "--yes"])
+            clear_events.assert_called_once()
+        self.assertIn("Cleared 1 event", out.getvalue())
+
 
 class AutostartCommandTests(unittest.TestCase):
     def test_enable_sets_managed_and_prints_labels(self) -> None:
@@ -1431,6 +1471,86 @@ class UninstallCommandTests(unittest.TestCase):
                 main(["--config", str(config_path), "uninstall"])
             teardown.assert_not_called()
         self.assertIn("Aborted", out.getvalue())
+
+    def test_uninstall_no_target_non_tty_without_yes_refuses(self) -> None:
+        # Full teardown is irreversible: a non-interactive run without --yes must
+        # refuse and exit non-zero, never tear down unprompted.
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli._interactive", return_value=False),
+                patch("agent_voice.cli.detect_wired_integrations", return_value=[]),
+                patch("agent_voice.cli.run_teardown") as teardown,
+                redirect_stdout(out),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--config", str(config_path), "uninstall"])
+            self.assertEqual(raised.exception.code, 2)
+            teardown.assert_not_called()
+        self.assertIn("Refusing", out.getvalue())
+        self.assertIn("--yes", out.getvalue())
+
+    def test_uninstall_no_target_non_tty_with_yes_proceeds(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            report = SimpleNamespace(
+                stopped=[], removed_hooks={}, removed_wrappers=[], removed_autostart=[],
+                keychain_deleted=False, backups_restored=[], data_removed=False,
+                notes=[], package_command=["pipx", "uninstall", "voiccce"],
+            )
+            with (
+                patch("agent_voice.cli._interactive", return_value=False),
+                patch("agent_voice.cli.detect_wired_integrations", return_value=[]),
+                patch("agent_voice.cli.run_teardown", return_value=report) as teardown,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "uninstall", "--yes"])
+            teardown.assert_called_once()
+        self.assertIn("pipx uninstall voiccce", out.getvalue())
+
+    def test_uninstall_purge_non_tty_without_yes_refuses(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli._interactive", return_value=False),
+                patch("agent_voice.cli.detect_wired_integrations", return_value=[]),
+                patch("agent_voice.cli.run_teardown") as teardown,
+                redirect_stdout(out),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--config", str(config_path), "uninstall", "--purge"])
+            self.assertEqual(raised.exception.code, 2)
+            teardown.assert_not_called()
+        self.assertIn("Refusing", out.getvalue())
+
+    def test_uninstall_target_non_tty_proceeds_without_yes(self) -> None:
+        # Single-target hook removal is reversible (re-setup re-wires it), so it
+        # stays non-destructive and needs no --yes even non-interactively.
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            result = SimpleNamespace(
+                removed_events=("Stop",),
+                settings_path=Path("/x/settings.json"),
+                wrapper_removed=True,
+            )
+            with (
+                patch("agent_voice.cli._interactive", return_value=False),
+                patch("agent_voice.cli.remove_claude_code_personal", return_value=result) as remove,
+                patch("agent_voice.cli.run_teardown") as teardown,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "uninstall", "claude-code"])
+            remove.assert_called_once()
+            teardown.assert_not_called()
+        self.assertIn("Removed claude-code hooks: Stop", out.getvalue())
 
 
 class ConfigSettersTests(unittest.TestCase):
@@ -1650,6 +1770,25 @@ class StatusCommandTests(unittest.TestCase):
         output = out.getvalue()
         self.assertIn("Quiet hours: active", output)
         self.assertIn("Stale pid: daemon pid 999", output)
+
+    def test_status_always_shows_quiet_hours_window_when_inactive(self) -> None:
+        # H5: the night-silence default is enforced, so the window + enabled
+        # state must be discoverable even when not currently active.
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            config = load_config(config_path)
+            with (
+                patch("agent_voice.cli.inspect_agent_wiring", return_value=[]),
+                patch("agent_voice.cli.in_quiet_hours", return_value=False),
+                patch("agent_voice.cli.stale_pid_warnings", return_value=[]),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "status"])
+        output = out.getvalue()
+        self.assertIn("Quiet hours: enabled", output)
+        self.assertIn(f"{config.quiet_hours_from}-{config.quiet_hours_to}", output)
 
 
 if __name__ == "__main__":

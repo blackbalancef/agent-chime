@@ -247,19 +247,26 @@ def process_once(
                 suppressed_reason = "rate_limited"
 
         # Spend cap: before any paid summary/TTS, total today's (and this month's)
-        # spend and, when at/over a cap, fall back to the free macos_say backend so
-        # no paid request is made. Logged once per cycle.
-        if (
-            deliver
-            and not terminal_only
-            and voice_allowed
-            and config.voice_backend == "openai_tts"
-        ):
+        # spend and, when at/over a cap, suppress every metered call this cycle.
+        # The cap is decoupled from the voice backend because the paid GPT summary
+        # is metered regardless of backend — on the default macos_say backend a cap
+        # must still skip the summary (and there is no paid TTS to force away from).
+        # ``force_backend`` is only set when the configured backend is openai_tts,
+        # so a custom/free backend keeps routing normally; ``capped`` always feeds
+        # the summary gate below.
+        capped: str | None = None
+        if deliver and not terminal_only and voice_allowed:
             capped = _spend_cap_reached(conn, config)
             if capped is not None:
-                force_backend = "macos_say"
+                if config.voice_backend == "openai_tts":
+                    force_backend = "macos_say"
                 _log(
-                    f"{capped} spend cap reached — falling back to free macos_say for this cycle"
+                    f"{capped} spend cap reached — skipping paid summary"
+                    + (
+                        " and falling back to free macos_say for this cycle"
+                        if config.voice_backend == "openai_tts"
+                        else " for this cycle"
+                    )
                 )
 
         summary_cost_usd = 0.0
@@ -272,13 +279,14 @@ def process_once(
             source_text = primary.summary_source_text or primary.message
         else:
             source_text = primary.message
-        # Skip the paid GPT summary when the spend cap forced the free backend —
-        # the summary is itself a metered call we must not make over the cap.
+        # Skip the paid GPT summary when a spend cap is reached — the summary is
+        # itself a metered call we must not make over the cap, regardless of the
+        # configured voice backend (the default macos_say still bills summaries).
         if (
             deliver
             and not terminal_only
             and voice_allowed
-            and force_backend is None
+            and capped is None
             and len(candidates) == 1
         ):
             summary_result = summarize_notification(config, primary)
@@ -535,12 +543,37 @@ def maybe_reload_config(
 
 
 def _startup_banner(config: AgentVoiceConfig) -> str:
+    quiet = (
+        f"quiet_hours={config.quiet_hours_from}-{config.quiet_hours_to} "
+        f"({'enabled' if config.quiet_hours_enabled else 'disabled'})"
+    )
     return (
         f"started v{_agent_version()} pid={os.getpid()} "
         f"voice_backend={config.voice_backend} "
         f"poll_interval={config.poll_interval_ms}ms "
+        f"{quiet} "
         f"db={config.database_path}"
     )
+
+
+def _write_daemon_pid(config: AgentVoiceConfig) -> Path | None:
+    """Record this process's pid in the daemon pid file (best-effort).
+
+    Even a launchd-managed daemon — started without going through
+    :func:`service.start_daemon` — writes its own pid file here so
+    ``daemon_status``/``stop``/``doctor`` can see and signal it. Returns the pid
+    path on success so a clean exit can clear it.
+    """
+    from .service import service_paths
+
+    pid_path = service_paths(config).pid_path
+    try:
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - defensive
+        _log(f"could not write pid file {pid_path}: {exc}")
+        return None
+    return pid_path
 
 
 def run_daemon(config: AgentVoiceConfig, *, once: bool = False, deliver: bool = True, terminal_only: bool = False) -> None:
@@ -549,18 +582,22 @@ def run_daemon(config: AgentVoiceConfig, *, once: bool = False, deliver: bool = 
     config_path = config.config_path
     last_mtime = _config_mtime(config_path)
     _log(_startup_banner(config))
+    # Claim/refresh our own pid file so a launchd-managed daemon (which never went
+    # through service.start_daemon) is still visible to status/stop/doctor.
+    pid_path = _write_daemon_pid(config)
     try:
         while True:
             # Resilience: one bad cycle must never take the daemon down. Any error in
-            # event processing or maintenance is logged and the loop continues. A
-            # heartbeat is written every cycle (after the body) so liveness reflects a
-            # completed pass, not merely that the process is up.
+            # event processing or maintenance is logged and the loop continues. The
+            # heartbeat is only refreshed after a SUCCESSFUL cycle, so a daemon whose
+            # every cycle raises goes stale and doctor reports it unhealthy instead of
+            # looking alive on a perpetual failure.
             try:
                 process_once(conn, config, deliver=deliver, terminal_only=terminal_only)
                 run_maintenance(conn, config, current_time=now_ts())
+                write_heartbeat(config)
             except Exception as exc:  # noqa: BLE001 - keep the daemon alive
                 _log(f"cycle error (continuing): {exc}")
-            write_heartbeat(config)
             if once:
                 return
             time.sleep(config.poll_interval_ms / 1000)
@@ -570,3 +607,9 @@ def run_daemon(config: AgentVoiceConfig, *, once: bool = False, deliver: bool = 
             config, last_mtime = maybe_reload_config(config, config_path, last_mtime)
     finally:
         conn.close()
+        # Clear our pid file on clean exit so the slot is not seen as a live daemon.
+        if pid_path is not None:
+            try:
+                pid_path.unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - defensive
+                pass

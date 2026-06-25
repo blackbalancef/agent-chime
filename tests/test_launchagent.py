@@ -10,6 +10,7 @@ from agent_voice import launchagent, service
 from agent_voice.launchagent import (
     DAEMON_LABEL,
     MENUBAR_LABEL,
+    _repo_root,
     autostart_status,
     daemon_spec,
     disable_autostart,
@@ -98,24 +99,58 @@ class RenderPlistTests(unittest.TestCase):
         self.assertEqual(parsed["ProgramArguments"], ["python3", "/a/b"])
         self.assertEqual(parsed["StandardOutPath"], "/tmp/out.log")
 
+    def test_render_emits_working_directory_and_environment(self) -> None:
+        # M6/L1 regression: launchd runs jobs from "/" with a bare env, so the
+        # plist must carry WorkingDirectory + EnvironmentVariables (PYTHONPATH)
+        # or `python -m agent_voice` cannot import a source-checkout package.
+        xml = render_plist(
+            DAEMON_LABEL,
+            ["python3", "-m", "agent_voice", "daemon"],
+            stdout_path="/tmp/o",
+            stderr_path="/tmp/e",
+            working_directory="/repo/root",
+            environment={"PYTHONPATH": "/repo/root:"},
+        )
+        parsed = plistlib.loads(xml.encode("utf-8"))
+        self.assertEqual(parsed["WorkingDirectory"], "/repo/root")
+        self.assertEqual(parsed["EnvironmentVariables"]["PYTHONPATH"], "/repo/root:")
+
+    def test_render_omits_working_directory_and_environment_when_unset(self) -> None:
+        # Backwards-compatible: callers that pass neither get a plist without the
+        # optional keys, so existing render_plist call sites are unaffected.
+        xml = render_plist(
+            DAEMON_LABEL,
+            ["python3"],
+            stdout_path="/tmp/o",
+            stderr_path="/tmp/e",
+        )
+        parsed = plistlib.loads(xml.encode("utf-8"))
+        self.assertNotIn("WorkingDirectory", parsed)
+        self.assertNotIn("EnvironmentVariables", parsed)
+
 
 class SpecTests(unittest.TestCase):
     def test_daemon_spec_uses_service_invocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = _config(tmp)
-            label, program_args, stdout, stderr = daemon_spec(config)
+            label, program_args, stdout, stderr, workdir, env = daemon_spec(config)
             self.assertEqual(label, DAEMON_LABEL)
             self.assertEqual(program_args, service.service_python_invocation(config, ["daemon"]))
             self.assertEqual(stdout, service.service_paths(config).log_path)
             self.assertEqual(stderr, service.service_paths(config).log_path)
+            self.assertEqual(workdir, _repo_root())
+            self.assertIn("PYTHONPATH", env)
+            self.assertIn(str(_repo_root()), env["PYTHONPATH"])
 
     def test_menubar_spec_uses_service_invocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = _config(tmp)
-            label, program_args, stdout, stderr = menubar_spec(config)
+            label, program_args, stdout, stderr, workdir, env = menubar_spec(config)
             self.assertEqual(label, MENUBAR_LABEL)
             self.assertEqual(program_args, service.service_python_invocation(config, ["menubar"]))
             self.assertEqual(stdout, service.menubar_service_paths(config).log_path)
+            self.assertEqual(workdir, _repo_root())
+            self.assertIn("PYTHONPATH", env)
 
 
 class EnableDisableTests(unittest.TestCase):
@@ -140,6 +175,82 @@ class EnableDisableTests(unittest.TestCase):
                 parsed["ProgramArguments"],
                 service.service_python_invocation(config, ["daemon"]),
             )
+
+    def test_enable_writes_working_directory_and_pythonpath(self) -> None:
+        # M6/L1 regression: the on-disk plist autostart writes must carry the repo
+        # root as WorkingDirectory and PYTHONPATH so launchd's bare-env job can
+        # import a source-checkout / --dev install, mirroring the manual launcher.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            launchagent.Path, "home", return_value=Path(tmp)
+        ):
+            config = _config(tmp)
+            enable_autostart(config, runner=FakeRunner())
+
+            parsed = plistlib.loads(plist_path(DAEMON_LABEL).read_bytes())
+            self.assertEqual(parsed["WorkingDirectory"], str(_repo_root()))
+            self.assertIn("PYTHONPATH", parsed["EnvironmentVariables"])
+            self.assertTrue(
+                parsed["EnvironmentVariables"]["PYTHONPATH"].startswith(
+                    str(_repo_root())
+                )
+            )
+
+    def test_enable_preserves_existing_pythonpath(self) -> None:
+        # Mirrors service._start_background_process: any inherited PYTHONPATH must
+        # be appended after the repo root, not dropped.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            launchagent.Path, "home", return_value=Path(tmp)
+        ), mock.patch.dict(os.environ, {"PYTHONPATH": "/existing/path"}):
+            config = _config(tmp)
+            enable_autostart(config, runner=FakeRunner())
+
+            parsed = plistlib.loads(plist_path(DAEMON_LABEL).read_bytes())
+            self.assertEqual(
+                parsed["EnvironmentVariables"]["PYTHONPATH"],
+                f"{_repo_root()}:/existing/path",
+            )
+
+    def test_enable_is_idempotent_when_already_loaded(self) -> None:
+        # M7 regression: bootstrap refuses an already-loaded label (exit != 0) and
+        # the load fallback fails too, but the job is in fact loaded (print/list
+        # succeed). enable must still report the labels as enabled instead of
+        # returning [] and making the CLI cry "Could not load any autostart agents".
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            launchagent.Path, "home", return_value=Path(tmp)
+        ):
+            config = _config(tmp)
+            # bootout best-effort succeeds is irrelevant; force the (re)load verbs
+            # to fail as launchctl does for an already-loaded job, but report it
+            # as loaded via print.
+            runner = FakeRunner(returncodes={"bootstrap": 1, "load": 1})
+
+            enabled = enable_autostart(config, runner=runner)
+
+            self.assertEqual(set(enabled), {DAEMON_LABEL, MENUBAR_LABEL})
+
+    def test_enable_boots_out_before_reload_for_fresh_plist(self) -> None:
+        # M7: re-enabling must boot the job out first so the reload re-reads the
+        # freshly written plist rather than silently keeping the stale one.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            launchagent.Path, "home", return_value=Path(tmp)
+        ):
+            config = _config(tmp)
+            runner = FakeRunner()
+
+            enable_autostart(config, runner=runner)
+
+            verbs = runner.verbs()
+            # Each label is booted out before being bootstrapped back in.
+            self.assertEqual(verbs.count("bootout"), 2)
+            # The first bootout precedes the first bootstrap, so the reload always
+            # re-reads the freshly written plist.
+            first_bootstrap = next(
+                i for i, c in enumerate(runner.calls) if c[1] == "bootstrap"
+            )
+            first_bootout = next(
+                i for i, c in enumerate(runner.calls) if c[1] == "bootout"
+            )
+            self.assertLess(first_bootout, first_bootstrap)
 
     def test_enable_without_menubar_only_installs_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
@@ -173,8 +284,11 @@ class EnableDisableTests(unittest.TestCase):
             launchagent.Path, "home", return_value=Path(tmp)
         ):
             config = _config(tmp)
-            # Both bootstrap and load fail -> label is written but not "enabled".
-            runner = FakeRunner(returncodes={"bootstrap": 1, "load": 1})
+            # Bootstrap+load fail AND the job is not already loaded (print+list
+            # fail) -> label is written but not "enabled".
+            runner = FakeRunner(
+                returncodes={"bootstrap": 1, "load": 1, "print": 1, "list": 1}
+            )
 
             enabled = enable_autostart(config, runner=runner)
 

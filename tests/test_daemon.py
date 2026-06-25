@@ -854,6 +854,63 @@ class SpendCapTests(unittest.TestCase):
             self.assertEqual(summarize_calls, [])                # paid summary skipped over the cap
             conn.close()
 
+    def test_daily_cap_skips_summary_on_macos_say_backend(self) -> None:
+        # H2: the spend cap must skip the paid GPT summary even when the configured
+        # backend is the (free) default macos_say — the summary is metered too.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = f"{tmp}/events.sqlite3"
+            conn = connect(db_path)
+            init_db(conn)
+            config = AgentVoiceConfig(
+                config_path=Path(tmp) / "config.toml",
+                database_path=db_path,
+                timezone="Europe/Belgrade",
+                quiet_hours_enabled=False,
+                min_seconds_between_voice_messages=0,
+                voice_backend="macos_say",  # the DEFAULT free backend
+                summary_enabled=True,
+                daily_spend_cap_usd=0.05,
+            )
+            self._seed_today_spend(conn, audio_cost=0.10)  # already over the $0.05 cap
+
+            enqueue_event(
+                conn,
+                NormalizedEvent.build(
+                    event_key="finished",
+                    agent_name="codex",
+                    event_type=EventType.TASK_FINISHED,
+                    project_name="api",
+                    session_id="s1",
+                ),
+            )
+
+            seen_force_backend: list[object] = []
+            summarize_calls: list[int] = []
+
+            class FakeDeliveryRouter:
+                def __init__(self, config, *, terminal_only: bool = False, force_backend=None) -> None:
+                    seen_force_backend.append(force_backend)
+
+                def deliver(self, message: str) -> list[DeliveryResult]:
+                    return [DeliveryResult(channel="macos_say", delivered=True, spoken=True, audio_generated=True)]
+
+            def fake_summarize(config, candidate):
+                summarize_calls.append(1)
+                return SummaryResult(message="x", cost_usd=0.001)
+
+            with (
+                patch("agent_voice.daemon.DeliveryRouter", FakeDeliveryRouter),
+                patch("agent_voice.daemon.summarize_notification", fake_summarize),
+            ):
+                process_once(conn, config, deliver=True, current_time=100)
+
+            # Paid summary skipped over the cap on the free backend.
+            self.assertEqual(summarize_calls, [])
+            # No force_backend is passed: the backend is already the free macos_say,
+            # so there is nothing to force away from.
+            self.assertEqual(seen_force_backend, [None])
+            conn.close()
+
     def test_under_cap_keeps_paid_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = f"{tmp}/events.sqlite3"
@@ -1030,6 +1087,26 @@ class HeartbeatTests(unittest.TestCase):
 class ResilienceTests(unittest.TestCase):
     def test_run_daemon_continues_after_a_bad_cycle(self) -> None:
         from agent_voice import daemon as daemon_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = f"{tmp}/events.sqlite3"
+            conn = connect(db_path)
+            init_db(conn)
+            conn.close()
+            config = AgentVoiceConfig(
+                config_path=Path(tmp) / "config.toml",
+                database_path=db_path,
+            )
+
+            with patch.object(daemon_module, "process_once", side_effect=RuntimeError("boom")):
+                # once=True runs a single cycle; the exception must be swallowed
+                # (run_daemon returns without raising — the daemon stays alive).
+                daemon_module.run_daemon(config, once=True, deliver=False)
+
+    def test_perpetually_failing_cycle_does_not_refresh_heartbeat(self) -> None:
+        # M3: write_heartbeat runs only after a SUCCESSFUL cycle, so a daemon whose
+        # every cycle raises does not look healthy to doctor.
+        from agent_voice import daemon as daemon_module
         from agent_voice.heartbeat import read_heartbeat
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1043,14 +1120,68 @@ class ResilienceTests(unittest.TestCase):
             )
 
             with patch.object(daemon_module, "process_once", side_effect=RuntimeError("boom")):
-                # once=True runs a single cycle; the exception must be swallowed.
                 daemon_module.run_daemon(config, once=True, deliver=False)
 
-            # Heartbeat is still written even though the cycle body raised.
+            # No heartbeat was written because the cycle never completed.
+            self.assertIsNone(read_heartbeat(config))
+
+    def test_successful_cycle_refreshes_heartbeat(self) -> None:
+        from agent_voice import daemon as daemon_module
+        from agent_voice.heartbeat import read_heartbeat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = f"{tmp}/events.sqlite3"
+            conn = connect(db_path)
+            init_db(conn)
+            conn.close()
+            config = AgentVoiceConfig(
+                config_path=Path(tmp) / "config.toml",
+                database_path=db_path,
+            )
+
+            daemon_module.run_daemon(config, once=True, deliver=False)
+
             heartbeat = read_heartbeat(config)
             self.assertIsNotNone(heartbeat)
             self.assertIn("pid", heartbeat)
             self.assertIn("ts", heartbeat)
+
+
+class DaemonPidFileTests(unittest.TestCase):
+    def test_run_daemon_writes_pid_file_during_run(self) -> None:
+        # H4: a launchd-managed daemon (started without service.start_daemon) must
+        # still write its own pid file so status/stop/doctor can see it.
+        import os as _os
+
+        from agent_voice import daemon as daemon_module
+        from agent_voice.service import service_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = f"{tmp}/events.sqlite3"
+            conn = connect(db_path)
+            init_db(conn)
+            conn.close()
+            config = AgentVoiceConfig(
+                config_path=Path(tmp) / "config.toml",
+                database_path=db_path,
+            )
+            pid_path = service_paths(config).pid_path
+
+            seen_pid: list[str | None] = []
+
+            def _record_pid(*args, **kwargs):
+                # Captured mid-run, before the finally block clears the pid file.
+                seen_pid.append(
+                    pid_path.read_text(encoding="utf-8") if pid_path.exists() else None
+                )
+                return None
+
+            with patch.object(daemon_module, "process_once", side_effect=_record_pid):
+                daemon_module.run_daemon(config, once=True, deliver=False)
+
+            self.assertEqual(seen_pid, [str(_os.getpid())])
+            # Clean exit clears the pid file so the slot is not seen as a live daemon.
+            self.assertFalse(pid_path.exists())
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from pathlib import Path
 from agent_voice.config import AgentVoiceConfig
 from agent_voice import service
 from agent_voice.service import (
+    daemon_status,
     is_pid_stale,
     menubar_service_paths,
     read_pid,
@@ -238,6 +239,69 @@ class StartBackgroundProcessRotationTests(unittest.TestCase):
             self.assertTrue(paths.log_path.with_suffix(".log.1").exists())
             self.assertEqual(captured["argv"], service_python_invocation(config, ["daemon"]))
             self.assertEqual(read_pid(paths.pid_path), os.getpid())
+
+
+class DaemonStatusTests(unittest.TestCase):
+    def test_running_with_live_pid_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            paths = service_paths(config)
+            paths.pid_path.parent.mkdir(parents=True, exist_ok=True)
+            paths.pid_path.write_text(str(os.getpid()), encoding="utf-8")
+
+            pid, running = daemon_status(config)
+
+            self.assertEqual(pid, os.getpid())
+            self.assertTrue(running)
+
+    def test_running_when_only_a_fresh_heartbeat_exists(self) -> None:
+        # H4: a launchd-managed daemon may not leave a live pid file. A fresh
+        # heartbeat alone must be read as "running" so status/doctor see it up.
+        from agent_voice.heartbeat import write_heartbeat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            # No pid file at all — only a heartbeat written just now.
+            write_heartbeat(config)
+
+            pid, running = daemon_status(config)
+
+            self.assertIsNone(pid)
+            self.assertTrue(running)
+
+    def test_down_when_heartbeat_is_stale(self) -> None:
+        from agent_voice.heartbeat import write_heartbeat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            # A heartbeat far older than the freshness window.
+            write_heartbeat(config, now=time.time() - 10_000)
+
+            pid, running = daemon_status(config)
+
+            self.assertIsNone(pid)
+            self.assertFalse(running)
+
+    def test_down_when_no_pid_and_no_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+
+            pid, running = daemon_status(config)
+
+            self.assertIsNone(pid)
+            self.assertFalse(running)
+
+    def test_down_when_pid_is_dead_and_no_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            paths = service_paths(config)
+            paths.pid_path.parent.mkdir(parents=True, exist_ok=True)
+            paths.pid_path.write_text("99999999", encoding="utf-8")
+
+            pid, running = daemon_status(config)
+
+            self.assertEqual(pid, 99999999)
+            self.assertFalse(running)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,9 @@ import os
 import plistlib
 import subprocess
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
+
+import agent_voice
 
 from .config import AgentVoiceConfig
 from . import service
@@ -47,12 +49,20 @@ def render_plist(
     stderr_path: str | os.PathLike[str],
     run_at_load: bool = True,
     keep_alive: bool = True,
+    working_directory: str | os.PathLike[str] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> str:
     """Render a launchd LaunchAgent plist as XML text.
 
     ``program_args`` is the full argv (typically from
     :func:`service.service_python_invocation`). ``run_at_load`` starts the job as
     soon as it is loaded; ``keep_alive`` asks launchd to restart it if it exits.
+
+    ``working_directory`` becomes ``WorkingDirectory`` and ``environment`` becomes
+    ``EnvironmentVariables``. launchd otherwise runs the job from ``/`` with a
+    bare environment, so these mirror what
+    :func:`service._start_background_process` sets (``cwd``/``PYTHONPATH``) and are
+    what lets ``python -m agent_voice`` import the package from a source checkout.
     """
     spec: dict[str, object] = {
         "Label": label,
@@ -62,28 +72,68 @@ def render_plist(
         "StandardOutPath": str(stdout_path),
         "StandardErrorPath": str(stderr_path),
     }
+    if working_directory is not None:
+        spec["WorkingDirectory"] = str(working_directory)
+    if environment:
+        spec["EnvironmentVariables"] = {str(k): str(v) for k, v in environment.items()}
     return plistlib.dumps(spec).decode("utf-8")
 
 
-def daemon_spec(config: AgentVoiceConfig) -> tuple[str, list[str], Path, Path]:
-    """Return ``(label, program_args, stdout, stderr)`` for the daemon agent."""
+def _repo_root() -> Path:
+    """Return the repository root that holds the ``agent_voice`` package.
+
+    Mirrors :func:`service._start_background_process`: a source checkout is
+    importable only when its parent dir is on ``sys.path``/``PYTHONPATH``.
+    """
+    return Path(agent_voice.__file__).resolve().parents[1]
+
+
+def _service_environment() -> dict[str, str]:
+    """Return the ``EnvironmentVariables`` mapping launchd needs to import us.
+
+    launchd starts jobs with a bare environment, so without this ``python -m
+    agent_voice`` cannot find a source-checkout package. Mirrors the ``PYTHONPATH``
+    that :func:`service._start_background_process` injects, preserving any existing
+    ``PYTHONPATH`` from the current environment.
+    """
+    repo_root = _repo_root()
+    existing = os.environ.get("PYTHONPATH", "")
+    return {"PYTHONPATH": f"{repo_root}:{existing}"}
+
+
+def daemon_spec(
+    config: AgentVoiceConfig,
+) -> tuple[str, list[str], Path, Path, Path, dict[str, str]]:
+    """Return the daemon agent spec.
+
+    ``(label, program_args, stdout, stderr, working_directory, environment)``.
+    """
     paths = service.service_paths(config)
     return (
         DAEMON_LABEL,
         service.service_python_invocation(config, ["daemon"]),
         paths.log_path,
         paths.log_path,
+        _repo_root(),
+        _service_environment(),
     )
 
 
-def menubar_spec(config: AgentVoiceConfig) -> tuple[str, list[str], Path, Path]:
-    """Return ``(label, program_args, stdout, stderr)`` for the menu bar agent."""
+def menubar_spec(
+    config: AgentVoiceConfig,
+) -> tuple[str, list[str], Path, Path, Path, dict[str, str]]:
+    """Return the menu bar agent spec.
+
+    ``(label, program_args, stdout, stderr, working_directory, environment)``.
+    """
     paths = service.menubar_service_paths(config)
     return (
         MENUBAR_LABEL,
         service.service_python_invocation(config, ["menubar"]),
         paths.log_path,
         paths.log_path,
+        _repo_root(),
+        _service_environment(),
     )
 
 
@@ -128,8 +178,10 @@ def enable_autostart(
     """Write LaunchAgent plists and load them through ``launchctl``.
 
     Always installs the daemon agent; the menu bar agent is installed only when
-    ``menubar`` is true. Returns the labels that were successfully loaded. This
-    does *not* touch the ``[autostart].managed`` config flag — the CLI owns that.
+    ``menubar`` is true. Returns the labels that ended up loaded — a label whose
+    job was already loaded still counts as enabled, so re-running this is
+    idempotent rather than reporting nothing was loaded. This does *not* touch the
+    ``[autostart].managed`` config flag — the CLI owns that.
     """
     specs = [daemon_spec(config)]
     if menubar:
@@ -137,7 +189,7 @@ def enable_autostart(
 
     launch_agents_dir().mkdir(parents=True, exist_ok=True)
     enabled: list[str] = []
-    for label, program_args, stdout_path, stderr_path in specs:
+    for label, program_args, stdout_path, stderr_path, working_directory, environment in specs:
         path = plist_path(label)
         path.write_text(
             render_plist(
@@ -145,10 +197,17 @@ def enable_autostart(
                 program_args,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
+                working_directory=working_directory,
+                environment=environment,
             ),
             encoding="utf-8",
         )
-        if _bootstrap(runner, path):
+        # Bootstrap refuses to load a label that is already loaded, so re-running
+        # `autostart enable` would otherwise fail to re-read the freshly written
+        # plist and report nothing enabled. Boot the job out first (best effort)
+        # so the reload always picks up the new plist, making enable idempotent.
+        _bootout(runner, label, path)
+        if _bootstrap(runner, path) or _is_loaded(runner, label):
             enabled.append(label)
     return enabled
 

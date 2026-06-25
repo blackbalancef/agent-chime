@@ -163,7 +163,24 @@ def restore_latest_backup(settings_path: Path = PERSONAL_SETTINGS_PATH) -> Path 
     Returns the backup that was restored, or ``None`` when no backup exists.
     """
     settings_path = settings_path.expanduser().resolve()
-    backup_path = _latest_backup(settings_path)
+    return _restore_backup(settings_path, _latest_backup(settings_path))
+
+
+def restore_original_backup(settings_path: Path = PERSONAL_SETTINGS_PATH) -> Path | None:
+    """Restore the OLDEST Voiccce backup over ``settings_path``.
+
+    The oldest backup is the one taken just before the very first install, so it
+    captures the user's pre-install settings. Restoring it during teardown undoes
+    Voiccce cleanly, whereas restoring the *latest* backup would re-apply the
+    still-installed state captured by :func:`remove_claude_code_personal`.
+
+    Returns the backup that was restored, or ``None`` when no backup exists.
+    """
+    settings_path = settings_path.expanduser().resolve()
+    return _restore_backup(settings_path, _oldest_backup(settings_path))
+
+
+def _restore_backup(settings_path: Path, backup_path: Path | None) -> Path | None:
     if backup_path is None:
         return None
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,13 +189,22 @@ def restore_latest_backup(settings_path: Path = PERSONAL_SETTINGS_PATH) -> Path 
     return backup_path
 
 
-def _latest_backup(settings_path: Path) -> Path | None:
+def _sorted_backups(settings_path: Path) -> list[Path]:
     prefix = f"{settings_path.name}.voiccce-backup."
-    candidates = sorted(
+    return sorted(
         (p for p in settings_path.parent.glob(f"{settings_path.name}.voiccce-backup.*") if p.name.startswith(prefix)),
         key=lambda p: p.name,
     )
+
+
+def _latest_backup(settings_path: Path) -> Path | None:
+    candidates = _sorted_backups(settings_path)
     return candidates[-1] if candidates else None
+
+
+def _oldest_backup(settings_path: Path) -> Path | None:
+    candidates = _sorted_backups(settings_path)
+    return candidates[0] if candidates else None
 
 
 def _remove_wrapper(wrapper_path: Path) -> bool:
@@ -198,10 +224,28 @@ def _read_settings(settings_path: Path) -> dict[str, object]:
     return json.loads(settings_path.read_text(encoding="utf-8"))
 
 
+def _unique_backup_path(settings_path: Path) -> Path:
+    """Return a non-existent backup path for ``settings_path``.
+
+    The base stamp has microsecond resolution so two backups taken in the same
+    second do not collide; a counter suffix is appended as a last-resort guard
+    when even the microsecond stamp matches (or the file already exists), so a
+    fast install+remove never overwrites the pre-install backup.
+    """
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    base = settings_path.with_name(f"{settings_path.name}.voiccce-backup.{stamp}")
+    if not base.exists():
+        return base
+    for counter in range(1, 1000):
+        candidate = base.with_name(f"{base.name}.{counter}")
+        if not candidate.exists():
+            return candidate
+    return base.with_name(f"{base.name}.{os.getpid()}")
+
+
 def _backup_settings(settings_path: Path) -> Path:
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
-    backup_path = settings_path.with_name(f"{settings_path.name}.voiccce-backup.{stamp}")
+    backup_path = _unique_backup_path(settings_path)
     if settings_path.exists():
         backup_path.write_text(settings_path.read_text(encoding="utf-8"), encoding="utf-8")
         backup_path.chmod(settings_path.stat().st_mode & 0o777)

@@ -457,6 +457,24 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgentVoiceConfig:
     else:
         voice_audio_tokens_per_second = float(configured_audio_tokens_per_second)
 
+    # A TOML-parseable file can still carry semantically out-of-range values (an
+    # invalid clock time, an unknown privacy level). Surface those as a
+    # ``ConfigError`` carrying the path so the caller keeps a single error
+    # contract instead of leaking a raw ``ValueError`` traceback.
+    try:
+        summary_privacy_level = normalize_summary_privacy_level(
+            summary.get("privacy_level", "full_last_message")
+        )
+        quiet_hours_from = normalize_hhmm(quiet_hours.get("from", "23:00"))
+        quiet_hours_to = normalize_hhmm(quiet_hours.get("to", "09:00"))
+    except ValueError as exc:
+        raise ConfigError(
+            f"Invalid config value: {exc}",
+            path=config_path,
+            hint="Fix the offending value, or restore the most recent "
+            "config.toml.bak-* backup written alongside it.",
+        ) from exc
+
     return AgentVoiceConfig(
         config_path=config_path,
         database_path=expand_path(daemon.get("database_path", str(DEFAULT_DB_PATH))),
@@ -493,7 +511,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgentVoiceConfig:
         summary_enabled=bool(summary.get("enabled", True)),
         summary_provider=normalize_summary_provider(summary.get("provider", "openai")),
         summary_model=summary.get("model", DEFAULT_SUMMARY_MODEL),
-        summary_privacy_level=normalize_summary_privacy_level(summary.get("privacy_level", "full_last_message")),
+        summary_privacy_level=summary_privacy_level,
         summary_max_input_chars=max(200, int(summary.get("max_input_chars", DEFAULT_SUMMARY_MAX_INPUT_CHARS))),
         summary_max_words=max(1, int(summary.get("max_words", 40))),
         summary_timeout_seconds=max(1, int(summary.get("timeout_seconds", 5))),
@@ -534,8 +552,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgentVoiceConfig:
         event_retention_days=max(0, int(daemon.get("event_retention_days", 30))),
         max_log_bytes=max(0, int(daemon.get("max_log_bytes", 5_000_000))),
         quiet_hours_enabled=bool(quiet_hours.get("enabled", True)),
-        quiet_hours_from=normalize_hhmm(quiet_hours.get("from", "23:00")),
-        quiet_hours_to=normalize_hhmm(quiet_hours.get("to", "09:00")),
+        quiet_hours_from=quiet_hours_from,
+        quiet_hours_to=quiet_hours_to,
         quiet_hours_voice=bool(quiet_hours.get("voice", False)),
         quiet_hours_desktop=bool(quiet_hours.get("desktop", True)),
         autostart_managed=bool(autostart.get("managed", False)),
@@ -1119,13 +1137,23 @@ def _multiline_open_delimiter(line: str) -> str | None:
 
     A line such as ``prompt = '''`` (or one whose triple-quote is not closed on the
     same line) starts a block whose interior lines must not be parsed as keys.
+
+    The triple-quote is only an opener when the assigned VALUE itself begins with it.
+    A single-line value that merely *contains* a triple-quote inside an
+    already-quoted string (e.g. ``instructions = "use ''' for blocks"``) is not an
+    opener — treating it as one would put every later line into a phantom
+    multi-line state. We therefore inspect the value portion after the first
+    ``'='`` rather than scanning the whole line.
     """
+    eq = line.find("=")
+    if eq == -1:
+        return None
+    value = line[eq + 1 :].lstrip()
     for delim in ("'''", '"""'):
-        idx = line.find(delim)
-        if idx == -1:
+        if not value.startswith(delim):
             continue
         # Closed on the same line (e.g. ``x = '''one-liner'''``)?
-        if line.find(delim, idx + len(delim)) != -1:
+        if value.find(delim, len(delim)) != -1:
             return None
         return delim
     return None

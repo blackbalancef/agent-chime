@@ -1050,8 +1050,13 @@ def cmd_status(args: argparse.Namespace) -> None:
     if config.summary_enabled:
         summary_status = f"{config.summary_provider} / {config.summary_model}"
     print(f"Summary: {summary_status}")
-    if in_quiet_hours(config):
-        print(f"Quiet hours: active ({config.quiet_hours_from}-{config.quiet_hours_to})")
+    window = f"{config.quiet_hours_from}-{config.quiet_hours_to}"
+    if not config.quiet_hours_enabled:
+        print(f"Quiet hours: disabled ({window})")
+    elif in_quiet_hours(config):
+        print(f"Quiet hours: active ({window})")
+    else:
+        print(f"Quiet hours: enabled ({window}, not active now)")
     pid, running = daemon_status(config)
     print(f"Daemon: {'running' if running else 'stopped'}" + (f" (pid {pid})" if pid else ""))
     menu_pid, menu_running = menubar_status(config)
@@ -1779,7 +1784,11 @@ def cmd_clear(args: argparse.Namespace) -> None:
         targets.append("events")
     if clear_history:
         targets.append("notification + session history")
-    if not _confirm_destructive(f"Clear {', '.join(targets)}?", assume_yes=args.yes):
+    if not _confirm_destructive(
+        f"Clear {', '.join(targets)}?",
+        assume_yes=args.yes,
+        action=f"to clear {', '.join(targets)}",
+    ):
         print("Aborted.")
         return
 
@@ -1800,14 +1809,19 @@ def cmd_clear(args: argparse.Namespace) -> None:
         print("Cleared the summary pipeline log.")
 
 
-def _confirm_destructive(question: str, *, assume_yes: bool) -> bool:
-    """Return whether a destructive action may proceed.
+def _confirm_destructive(question: str, *, assume_yes: bool, action: str) -> bool:
+    """Return whether an irreversible action may proceed.
 
-    ``--yes`` and non-interactive runs proceed without prompting; an interactive
-    TTY gets an arrow-key yes/no confirm defaulting to No.
+    ``--yes`` always proceeds. An interactive TTY gets an arrow-key yes/no
+    confirm defaulting to No. A non-interactive run (script, pipe, CI, cron)
+    without ``--yes`` is REFUSED — the action is irreversible, so it must never
+    happen unprompted; we print a hint and exit non-zero.
     """
-    if assume_yes or not _interactive():
+    if assume_yes:
         return True
+    if not _interactive():
+        print(f"Refusing {action} without confirmation; pass --yes.")
+        raise SystemExit(2)
     return confirm(question, default=False)
 
 
@@ -1884,8 +1898,11 @@ def _uninstall_all(config: AgentVoiceConfig, args: argparse.Namespace) -> None:
     wired = detect_wired_integrations(config)
     summary = ", ".join(wired) if wired else "no wired integrations"
     purge_note = " and DELETE ~/.voiccce" if args.purge else " (keeping ~/.voiccce)"
+    action = "to purge Voiccce" if args.purge else "to tear down Voiccce"
     if not _confirm_destructive(
-        f"Tear down Voiccce ({summary}){purge_note}?", assume_yes=args.yes
+        f"Tear down Voiccce ({summary}){purge_note}?",
+        assume_yes=args.yes,
+        action=action,
     ):
         print("Aborted.")
         return

@@ -9,6 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AgentVoiceConfig
+from .heartbeat import heartbeat_age_seconds
+
+# A daemon with no live pid file is still considered running when its heartbeat is
+# fresher than this many seconds — covers launchd-managed daemons whose pid file
+# may be absent/replaced. Mirrors doctor's heartbeat-stale floor so status and
+# health agree.
+HEARTBEAT_FRESH_POLL_MULTIPLIER = 5
+HEARTBEAT_FRESH_MIN_SECONDS = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,10 +193,35 @@ def _stop_background_process(paths: ServicePaths) -> int | None:
     return pid
 
 
+def _heartbeat_is_fresh(config: AgentVoiceConfig) -> bool:
+    """Whether the daemon heartbeat is recent enough to imply a live daemon.
+
+    Used as a fallback for launchd-managed daemons that may not leave a live pid
+    file: a heartbeat within the freshness window means a daemon is ticking even
+    though no pid is recorded here. The window scales with the poll interval and is
+    floored so a tiny interval does not flap on a slow tick.
+    """
+    age = heartbeat_age_seconds(config)
+    if age is None:
+        return False
+    threshold = max(
+        HEARTBEAT_FRESH_MIN_SECONDS,
+        HEARTBEAT_FRESH_POLL_MULTIPLIER * (config.poll_interval_ms / 1000.0),
+    )
+    return age <= threshold
+
+
 def daemon_status(config: AgentVoiceConfig) -> tuple[int | None, bool]:
     paths = service_paths(config)
     pid = read_pid(paths.pid_path)
-    return pid, bool(pid and is_pid_running(pid))
+    if pid and is_pid_running(pid):
+        return pid, True
+    # No live pid file (e.g. a launchd-managed daemon that did not record one, or a
+    # replaced file): treat a fresh heartbeat as proof the daemon is running so it
+    # is not reported DOWN.
+    if _heartbeat_is_fresh(config):
+        return pid, True
+    return pid, False
 
 
 def menubar_status(config: AgentVoiceConfig) -> tuple[int | None, bool]:
