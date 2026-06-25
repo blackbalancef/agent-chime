@@ -19,11 +19,14 @@ from agent_voice.cli import (
     _resolve_setup_language,
     _resolve_stop_hotkey,
     _resolve_voice_backend,
+    _test_remediation_hint,
     _update_install_command,
     build_parser,
+    format_bytes,
     main,
 )
 from agent_voice.config import load_config, set_voice_config, write_default_config
+from agent_voice.doctor import CheckResult
 from agent_voice.runtime import set_active_voice_sessions
 
 
@@ -816,30 +819,44 @@ class UpdateCommandTests(unittest.TestCase):
         (source / "agent_voice").mkdir()
         return source
 
-    def test_update_install_command_uses_pipx_runpip_inside_pipx_venv(self) -> None:
-        source = Path("/work/voiccce")
+    def test_update_install_command_uses_pipx_install_force_inside_pipx_venv(self) -> None:
+        # A pipx-managed venv reinstalls the whole app non-editably, letting pip
+        # resolve dependencies (the old unconditional --no-deps was dropped).
+        source = "/work/voiccce"
         with (
             patch("agent_voice.cli.sys.prefix", "/Users/me/.local/pipx/venvs/voiccce"),
             patch("agent_voice.cli.shutil.which", return_value="/opt/homebrew/bin/pipx"),
         ):
             command = _update_install_command(source)
 
+        self.assertEqual(command, ["pipx", "install", "--force", source])
+
+    def test_update_install_command_git_url_uses_pipx_install_force(self) -> None:
+        target = "git+https://github.com/blackbalancef/voiccce@main"
+        with (
+            patch("agent_voice.cli.sys.prefix", "/Users/me/.local/pipx/venvs/voiccce"),
+            patch("agent_voice.cli.shutil.which", return_value="/opt/homebrew/bin/pipx"),
+        ):
+            command = _update_install_command(target)
+
+        self.assertEqual(command, ["pipx", "install", "--force", target])
+
+    def test_update_install_command_dev_uses_editable_runpip(self) -> None:
+        # --dev forces an editable install via runpip even inside a pipx venv.
+        source = "/work/voiccce"
+        with (
+            patch("agent_voice.cli.sys.prefix", "/Users/me/.local/pipx/venvs/voiccce"),
+            patch("agent_voice.cli.shutil.which", return_value="/opt/homebrew/bin/pipx"),
+        ):
+            command = _update_install_command(source, editable=True)
+
         self.assertEqual(
             command,
-            [
-                "pipx",
-                "runpip",
-                "voiccce",
-                "install",
-                "--force-reinstall",
-                "--no-deps",
-                "-e",
-                str(source),
-            ],
+            ["pipx", "runpip", "voiccce", "install", "--force-reinstall", "-e", source],
         )
 
     def test_update_install_command_falls_back_to_current_python(self) -> None:
-        source = Path("/work/voiccce")
+        source = "/work/voiccce"
         with (
             patch("agent_voice.cli.sys.prefix", "/tmp/venv"),
             patch("agent_voice.cli.shutil.which", return_value=None),
@@ -848,39 +865,8 @@ class UpdateCommandTests(unittest.TestCase):
 
         self.assertEqual(
             command,
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--force-reinstall",
-                "--no-deps",
-                "-e",
-                str(source),
-            ],
+            [sys.executable, "-m", "pip", "install", "--force-reinstall", source],
         )
-
-    def test_update_install_command_detects_pipx_app_on_path(self) -> None:
-        source = Path("/work/voiccce")
-        with tempfile.TemporaryDirectory() as tmp:
-            script = Path(tmp) / "pipx" / "venvs" / "voiccce" / "bin" / "voiccce"
-            script.parent.mkdir(parents=True)
-            script.write_text("#!/bin/sh\n", encoding="utf-8")
-
-            def which(name: str) -> str | None:
-                if name == "voiccce":
-                    return str(script)
-                if name == "pipx":
-                    return "/opt/homebrew/bin/pipx"
-                return None
-
-            with (
-                patch("agent_voice.cli.sys.prefix", "/usr/local"),
-                patch("agent_voice.cli.shutil.which", side_effect=which),
-            ):
-                command = _update_install_command(source)
-
-        self.assertEqual(command[:3], ["pipx", "runpip", "voiccce"])
 
     def test_resolve_update_source_accepts_explicit_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -899,6 +885,47 @@ class UpdateCommandTests(unittest.TestCase):
             ):
                 self.assertEqual(_resolve_update_source(None), source.resolve())
 
+    def test_resolve_update_source_returns_none_when_no_checkout(self) -> None:
+        # No --source, not in a checkout, and no recorded install source → None,
+        # so the caller updates from the git URL instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir()
+            with (
+                patch("agent_voice.cli.Path.cwd", return_value=elsewhere),
+                patch("agent_voice.cli._installed_source_path", return_value=None),
+            ):
+                self.assertIsNone(_resolve_update_source(None))
+
+    def test_update_from_git_when_no_local_checkout(self) -> None:
+        # With no checkout the update installs from git+url@ref via the build command.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with (
+                patch("agent_voice.cli._resolve_update_source", return_value=None),
+                patch("agent_voice.cli._update_install_command", return_value=["install"]) as command,
+                patch("agent_voice.cli.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+                patch("agent_voice.cli.daemon_status", return_value=(None, False)),
+                patch("agent_voice.cli.menubar_status", return_value=(None, False)),
+                redirect_stdout(StringIO()),
+            ):
+                main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "update",
+                        "--ref",
+                        "v2",
+                        "--no-hooks",
+                        "--no-probe",
+                    ]
+                )
+
+            command.assert_called_once_with(
+                "git+https://github.com/blackbalancef/voiccce@v2", editable=False
+            )
+            run.assert_called_once_with(["install"], cwd=None)
+
     def test_update_restarts_running_services_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -908,6 +935,8 @@ class UpdateCommandTests(unittest.TestCase):
             with (
                 patch("agent_voice.cli._update_install_command", return_value=["install"]) as command,
                 patch("agent_voice.cli.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+                patch("agent_voice.cli._reapply_wired_hooks") as reapply,
+                patch("agent_voice.cli._health_probe") as probe,
                 patch("agent_voice.cli.daemon_status", return_value=(111, True)),
                 patch("agent_voice.cli.menubar_status", return_value=(222, True)),
                 patch("agent_voice.cli.stop_daemon", return_value=111) as stop_daemon_mock,
@@ -918,12 +947,44 @@ class UpdateCommandTests(unittest.TestCase):
             ):
                 main(["--config", str(config_path), "update", "--source", str(source)])
 
-            command.assert_called_once_with(source.resolve())
+            command.assert_called_once_with(str(source.resolve()), editable=False)
             run.assert_called_once_with(["install"], cwd=str(source.resolve()))
+            reapply.assert_called_once()
+            probe.assert_called_once()
             stop_daemon_mock.assert_called_once()
             start_daemon_mock.assert_called_once()
             stop_menubar_mock.assert_called_once()
             start_menubar_mock.assert_called_once()
+
+    def test_update_no_hooks_no_probe_skip_reapply_and_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_checkout(root)
+            config_path = root / "config.toml"
+
+            with (
+                patch("agent_voice.cli._update_install_command", return_value=["install"]),
+                patch("agent_voice.cli.subprocess.run", return_value=SimpleNamespace(returncode=0)),
+                patch("agent_voice.cli._reapply_wired_hooks") as reapply,
+                patch("agent_voice.cli._health_probe") as probe,
+                patch("agent_voice.cli.daemon_status", return_value=(None, False)),
+                patch("agent_voice.cli.menubar_status", return_value=(None, False)),
+                redirect_stdout(StringIO()),
+            ):
+                main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "update",
+                        "--source",
+                        str(source),
+                        "--no-hooks",
+                        "--no-probe",
+                    ]
+                )
+
+            reapply.assert_not_called()
+            probe.assert_not_called()
 
     def test_update_failure_does_not_restart_services(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1041,6 +1102,554 @@ class MenubarSetupTests(unittest.TestCase):
         ):
             command = _menubar_install_command()
         self.assertEqual(command, [sys.executable, "-m", "pip", "install", "pyobjc-framework-Cocoa"])
+
+
+class VersionTests(unittest.TestCase):
+    def test_version_flag_prints_version_and_exits(self) -> None:
+        out = StringIO()
+        with patch("agent_voice.cli._resolve_version", return_value="9.9.9"):
+            parser = build_parser()
+            with redirect_stdout(out), self.assertRaises(SystemExit) as raised:
+                parser.parse_args(["--version"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("9.9.9", out.getvalue())
+
+    def test_short_version_flag(self) -> None:
+        out = StringIO()
+        with patch("agent_voice.cli._resolve_version", return_value="1.2.3"):
+            parser = build_parser()
+            with redirect_stdout(out), self.assertRaises(SystemExit):
+                parser.parse_args(["-V"])
+        self.assertIn("1.2.3", out.getvalue())
+
+
+class DoctorCommandTests(unittest.TestCase):
+    def _results(self, *, ok: bool) -> list[CheckResult]:
+        return [
+            CheckResult(name="config", ok=True, detail="loaded"),
+            CheckResult(name="hooks", ok=ok, detail="no agents wired", hint="run setup"),
+        ]
+
+    def test_doctor_prints_pass_fail_and_exits_nonzero_on_failure(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with (
+                patch("agent_voice.cli.run_doctor", return_value=self._results(ok=False)),
+                redirect_stdout(out),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--config", str(config_path), "doctor"])
+        self.assertEqual(raised.exception.code, 1)
+        output = out.getvalue()
+        self.assertIn("[PASS] config", output)
+        self.assertIn("[FAIL] hooks", output)
+        self.assertIn("hint: run setup", output)
+
+    def test_doctor_ok_exits_zero(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with (
+                patch("agent_voice.cli.run_doctor", return_value=self._results(ok=True)) as run_doctor,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "doctor", "--no-validate-key"])
+            self.assertFalse(run_doctor.call_args.kwargs["validate_key"])
+
+    def test_doctor_json_is_machine_readable(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with (
+                patch("agent_voice.cli.run_doctor", return_value=self._results(ok=True)),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "doctor", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual({c["name"] for c in payload["checks"]}, {"config", "hooks"})
+
+
+class LogsCommandTests(unittest.TestCase):
+    def test_logs_friendly_message_when_missing(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with redirect_stdout(out):
+                main(["--config", str(config_path), "logs"])
+        self.assertIn("No daemon log yet", out.getvalue())
+
+    def test_logs_tails_last_n_lines(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            log_path = config_path.parent / "daemon.log"
+            log_path.write_text("\n".join(f"line{i}" for i in range(10)) + "\n", encoding="utf-8")
+            with redirect_stdout(out):
+                main(["--config", str(config_path), "logs", "-n", "3"])
+        output = out.getvalue()
+        self.assertIn("line9", output)
+        self.assertIn("line7", output)
+        self.assertNotIn("line6", output)
+
+    def test_logs_summary_source_uses_pipeline_log(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            (config_path.parent / "summary.log").write_text("summary line\n", encoding="utf-8")
+            with redirect_stdout(out):
+                main(["--config", str(config_path), "logs", "--summary"])
+        self.assertIn("summary line", out.getvalue())
+
+
+class PruneCommandTests(unittest.TestCase):
+    def test_prune_removes_old_processed_events(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli.prune_processed_events", return_value=5) as prune,
+                patch("agent_voice.cli.vacuum_db"),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "prune", "--older-than", "30d"])
+            prune.assert_called_once()
+            cutoff = prune.call_args.kwargs["older_than_epoch"]
+            self.assertLess(cutoff, int(__import__("time").time()))
+        self.assertIn("Pruned 5 processed event", out.getvalue())
+
+    def test_prune_invalid_age_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
+                main(["--config", str(config_path), "prune", "--older-than", "nonsense"])
+
+
+class ClearCommandTests(unittest.TestCase):
+    def test_clear_events_with_yes(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli.clear_events", return_value=3) as clear_events,
+                patch("agent_voice.cli.clear_notifications") as clear_notifications,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "clear", "--events", "--yes"])
+            clear_events.assert_called_once()
+            clear_notifications.assert_not_called()
+        self.assertIn("Cleared 3 event", out.getvalue())
+
+    def test_clear_all_truncates_pipeline_log(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli.clear_events", return_value=1),
+                patch("agent_voice.cli.clear_notifications", return_value=2),
+                patch("agent_voice.cli.clear_session_states", return_value=4),
+                patch("agent_voice.cli.truncate_pipeline_log") as truncate,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "clear", "--all", "--yes"])
+            truncate.assert_called_once()
+        self.assertIn("pipeline log", out.getvalue())
+
+    def test_clear_nothing_selected_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
+                main(["--config", str(config_path), "clear"])
+
+    def test_clear_aborts_when_confirm_declined(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli._interactive", return_value=True),
+                patch("agent_voice.cli.confirm", return_value=False),
+                patch("agent_voice.cli.clear_events") as clear_events,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "clear", "--events"])
+            clear_events.assert_not_called()
+        self.assertIn("Aborted", out.getvalue())
+
+
+class AutostartCommandTests(unittest.TestCase):
+    def test_enable_sets_managed_and_prints_labels(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli.sys.platform", "darwin"),
+                patch("agent_voice.cli.enable_autostart", return_value=["com.voiccce.daemon"]) as enable,
+                patch("agent_voice.cli.set_autostart_managed") as set_managed,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "autostart", "enable"])
+            enable.assert_called_once()
+            self.assertIs(set_managed.call_args.args[1], True)
+        self.assertIn("com.voiccce.daemon", out.getvalue())
+
+    def test_enable_non_darwin_warns(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli.sys.platform", "linux"),
+                patch("agent_voice.cli.enable_autostart") as enable,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "autostart", "enable"])
+            enable.assert_not_called()
+        self.assertIn("launchd", out.getvalue())
+
+    def test_disable_sets_managed_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli.sys.platform", "darwin"),
+                patch("agent_voice.cli.disable_autostart", return_value=["com.voiccce.daemon"]),
+                patch("agent_voice.cli.set_autostart_managed") as set_managed,
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "autostart", "disable"])
+            self.assertIs(set_managed.call_args.args[1], False)
+
+    def test_status_reports_managed_flag(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            status = {
+                "com.voiccce.daemon": {"plist_present": True, "loaded": True},
+                "com.voiccce.menubar": {"plist_present": False, "loaded": False},
+            }
+            with (
+                patch("agent_voice.cli.sys.platform", "darwin"),
+                patch("agent_voice.cli.autostart_status", return_value=status),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "autostart", "status"])
+        self.assertIn("Autostart managed:", out.getvalue())
+        self.assertIn("loaded", out.getvalue())
+
+
+class UninstallCommandTests(unittest.TestCase):
+    def test_uninstall_target_removes_only_that_integration(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            result = SimpleNamespace(
+                removed_events=("Stop",),
+                settings_path=Path("/x/settings.json"),
+                wrapper_removed=True,
+            )
+            with (
+                patch("agent_voice.cli.remove_claude_code_personal", return_value=result) as remove,
+                patch("agent_voice.cli.run_teardown") as teardown,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "uninstall", "claude-code"])
+            remove.assert_called_once()
+            teardown.assert_not_called()
+        self.assertIn("Removed claude-code hooks: Stop", out.getvalue())
+
+    def test_uninstall_no_target_runs_full_teardown(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            report = SimpleNamespace(
+                stopped=["daemon"],
+                removed_hooks={"claude-code": ["Stop"], "pi": True},
+                removed_wrappers=["/x/wrapper"],
+                removed_autostart=["com.voiccce.daemon"],
+                keychain_deleted=True,
+                backups_restored=[],
+                data_removed=False,
+                notes=["Kept data directory."],
+                package_command=["pipx", "uninstall", "voiccce"],
+            )
+            with (
+                patch("agent_voice.cli.detect_wired_integrations", return_value=["claude-code"]),
+                patch("agent_voice.cli.run_teardown", return_value=report) as teardown,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "uninstall", "--yes"])
+            teardown.assert_called_once()
+            plan = teardown.call_args.args[1]
+            self.assertFalse(plan.purge_data)
+        output = out.getvalue()
+        self.assertIn("pipx uninstall voiccce", output)
+        self.assertIn("Keychain secret deleted: True", output)
+
+    def test_uninstall_purge_passes_purge_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            report = SimpleNamespace(
+                stopped=[], removed_hooks={}, removed_wrappers=[], removed_autostart=[],
+                keychain_deleted=False, backups_restored=[], data_removed=True,
+                notes=[], package_command=["pip", "uninstall", "-y", "voiccce"],
+            )
+            with (
+                patch("agent_voice.cli.detect_wired_integrations", return_value=[]),
+                patch("agent_voice.cli.run_teardown", return_value=report) as teardown,
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "uninstall", "--purge", "--yes"])
+            self.assertTrue(teardown.call_args.args[1].purge_data)
+
+    def test_uninstall_aborts_when_confirm_declined(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli._interactive", return_value=True),
+                patch("agent_voice.cli.confirm", return_value=False),
+                patch("agent_voice.cli.detect_wired_integrations", return_value=[]),
+                patch("agent_voice.cli.run_teardown") as teardown,
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "uninstall"])
+            teardown.assert_not_called()
+        self.assertIn("Aborted", out.getvalue())
+
+
+class ConfigSettersTests(unittest.TestCase):
+    def _run_config(self, config_path: Path, *args: str) -> str:
+        out = StringIO()
+        with redirect_stdout(out):
+            main(["--config", str(config_path), "config", *args])
+        return out.getvalue()
+
+    def test_summary_privacy_and_toggle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            self._run_config(config_path, "--summary", "off", "--summary-privacy", "metadata_only")
+            config = load_config(config_path)
+            self.assertFalse(config.summary_enabled)
+            self.assertEqual(config.summary_privacy_level, "metadata_only")
+
+    def test_summary_model_provider_pipeline_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            self._run_config(
+                config_path,
+                "--summary-model", "gpt-5.4-mini",
+                "--summary-provider", "fallback",
+                "--summary-pipeline-log", "off",
+            )
+            config = load_config(config_path)
+            self.assertEqual(config.summary_model, "gpt-5.4-mini")
+            self.assertEqual(config.summary_provider, "fallback")
+            self.assertFalse(config.summary_pipeline_log)
+
+    def test_event_flag_toggles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            self._run_config(config_path, "--event", "subagent_finished=on", "--event", "task_failed=off")
+            config = load_config(config_path)
+            self.assertTrue(config.notify_subagent_finished)
+            self.assertFalse(config.notify_task_failed)
+
+    def test_unknown_event_name_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
+                main(["--config", str(config_path), "config", "--event", "bogus=on"])
+
+    def test_spend_caps_and_rate_and_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            output = self._run_config(
+                config_path,
+                "--max-events-per-minute", "12",
+                "--daily-spend-cap", "1.5",
+                "--monthly-spend-cap", "20",
+                "--event-retention-days", "7",
+            )
+            config = load_config(config_path)
+            self.assertEqual(config.max_events_per_minute, 12)
+            self.assertEqual(config.daily_spend_cap_usd, 1.5)
+            self.assertEqual(config.monthly_spend_cap_usd, 20.0)
+            self.assertEqual(config.event_retention_days, 7)
+            self.assertIn("Max events per minute: 12", output)
+            self.assertIn("Event retention days: 7", output)
+
+    def test_interrupt_on_reply_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            self._run_config(config_path, "--interrupt-on-reply", "off")
+            self.assertFalse(load_config(config_path).voice_interrupt_on_user_input)
+
+    def test_reset_section_writes_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            self._run_config(config_path, "--summary", "off")  # diverge from defaults
+            output = self._run_config(config_path, "--reset", "--reset-section", "summary")
+            self.assertIn("Backup:", output)
+            self.assertTrue(load_config(config_path).summary_enabled)
+
+    def test_reset_unknown_section_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
+                main(["--config", str(config_path), "config", "--reset", "--reset-section", "nope"])
+
+    def test_config_display_shows_new_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            output = self._run_config(config_path)
+            self.assertIn("Quiet hours:", output)
+            self.assertIn("Summary pipeline log:", output)
+            self.assertIn("Interrupt on reply:", output)
+
+
+class TestCommandFeedbackTests(unittest.TestCase):
+    def _router(self, results):
+        router = MagicMock()
+        router.deliver.return_value = results
+        return router
+
+    def test_success_reports_channel(self) -> None:
+        out = StringIO()
+        results = [SimpleNamespace(delivered=True, spoken=True, channel="macos_say", error=None)]
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with (
+                patch("agent_voice.cli.DeliveryRouter", return_value=self._router(results)),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "test"])
+        self.assertIn("Test played via macos_say", out.getvalue())
+
+    def test_failure_reports_error_and_hint_and_exits(self) -> None:
+        out = StringIO()
+        results = [SimpleNamespace(delivered=False, spoken=False, channel="openai_tts", error="HTTP 401: invalid key")]
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with (
+                patch("agent_voice.cli.DeliveryRouter", return_value=self._router(results)),
+                redirect_stdout(out),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--config", str(config_path), "test"])
+        self.assertEqual(raised.exception.code, 1)
+        output = out.getvalue()
+        self.assertIn("Test failed", output)
+        self.assertIn("voiccce secret set openai", output)
+
+    def test_remediation_hint_mapping(self) -> None:
+        self.assertIn("unmute", _test_remediation_hint("voice muted"))
+        self.assertIn("secret set openai", _test_remediation_hint("HTTP 401: nope"))
+        self.assertIn("afplay", _test_remediation_hint("afplay command not found"))
+        self.assertIsNone(_test_remediation_hint(None))
+
+
+class NonMacosWarningTests(unittest.TestCase):
+    def test_install_warns_on_non_macos(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with (
+                patch("agent_voice.cli.sys.platform", "linux"),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "install"])
+        self.assertIn("targets macOS", out.getvalue())
+
+    def test_setup_warns_on_non_macos_and_prints_privacy_note(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            router = MagicMock()
+            router.deliver.return_value = [SimpleNamespace(spoken=True, error=None)]
+            with (
+                patch("agent_voice.cli.sys.platform", "linux"),
+                patch("agent_voice.cli._maybe_setup_menubar"),
+                patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}),
+                patch(
+                    "agent_voice.cli.validate_openai_tts_key",
+                    return_value=SimpleNamespace(ok=True, error=None),
+                ),
+                patch("agent_voice.cli.install_claude_code_personal",
+                      side_effect=lambda **kw: SimpleNamespace(settings_path=Path("/tmp/s.json"))),
+                patch("agent_voice.cli.start_daemon", return_value=1),
+                patch("agent_voice.cli.DeliveryRouter", return_value=router),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "setup", "claude-code", "--no-test"])
+        output = out.getvalue()
+        self.assertIn("targets macOS", output)
+        self.assertIn("summary-privacy metadata_only", output)
+
+
+class FormatBytesTests(unittest.TestCase):
+    def test_format_bytes(self) -> None:
+        self.assertEqual(format_bytes(0), "0 B")
+        self.assertEqual(format_bytes(512), "512 B")
+        self.assertEqual(format_bytes(1536), "1.5 KB")
+        self.assertEqual(format_bytes(5 * 1024 * 1024), "5.0 MB")
+
+
+class StatusCommandTests(unittest.TestCase):
+    def test_status_shows_version_and_agent_wiring(self) -> None:
+        out = StringIO()
+        wiring = [
+            SimpleNamespace(agent="claude-code", wired=True, events=("Stop",), detail="wired"),
+            SimpleNamespace(agent="pi", wired=False, events=(), detail="no extension"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli._resolve_version", return_value="7.7.7"),
+                patch("agent_voice.cli.inspect_agent_wiring", return_value=wiring),
+                patch("agent_voice.cli.in_quiet_hours", return_value=False),
+                patch("agent_voice.cli.stale_pid_warnings", return_value=[]),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "status"])
+        output = out.getvalue()
+        self.assertIn("Version: 7.7.7", output)
+        self.assertIn("claude-code: wired (Stop)", output)
+        self.assertIn("pi: not wired", output)
+        self.assertNotIn("Adapters:", output)
+
+    def test_status_reports_quiet_hours_and_stale_pid(self) -> None:
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with (
+                patch("agent_voice.cli.inspect_agent_wiring", return_value=[]),
+                patch("agent_voice.cli.in_quiet_hours", return_value=True),
+                patch("agent_voice.cli.stale_pid_warnings", return_value=[("daemon", 999)]),
+                redirect_stdout(out),
+            ):
+                main(["--config", str(config_path), "status"])
+        output = out.getvalue()
+        self.assertIn("Quiet hours: active", output)
+        self.assertIn("Stale pid: daemon pid 999", output)
 
 
 if __name__ == "__main__":

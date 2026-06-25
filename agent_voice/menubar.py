@@ -67,7 +67,19 @@ from .config import (
     set_summary_config,
     set_voice_config,
 )
+from .installer.claude_code import (
+    install_claude_code_personal,
+    remove_claude_code_personal,
+)
+from .installer.codex import install_codex_personal, remove_codex_personal
+from .installer.pi import install_pi_personal, remove_pi_personal
+from .secrets import (
+    get_openai_secret_status,
+    set_openai_keychain_secret,
+    validate_openai_tts_key,
+)
 from .delivery import DeliveryRouter, test_message
+from .doctor import inspect_agent_wiring
 from .hotkey import (
     HOTKEY_PRESETS,
     GlobalHotkey,
@@ -99,6 +111,42 @@ from .usage import (
 
 AGENT_LABELS = {"claude-code": "Claude", "codex": "Codex", "pi": "Pi", "other": "Other"}
 CHANNEL_LABELS = {"openai_tts": "OpenAI", "macos_say": "say"}
+
+# Voice engine (backend) choices surfaced as a submenu, paired with a display
+# label and the default voice to fall back to when switching into them.
+VOICE_BACKEND_LABELS = {"macos_say": "macOS say", "openai_tts": "OpenAI TTS"}
+VOICE_BACKEND_DEFAULT_VOICE = {"openai_tts": "marin", "macos_say": "Alex"}
+
+# Lifecycle event toggles, paired with the config attribute exposed on
+# AgentVoiceConfig so the checkmark reflects live state.
+EVENT_TOGGLES: tuple[tuple[str, str, str], ...] = (
+    ("task_finished", "notify_task_finished", "Task finished"),
+    ("permission_needed", "notify_permission_needed", "Permission needed"),
+    ("input_needed", "notify_input_needed", "Input needed"),
+    ("task_failed", "notify_task_failed", "Task failed"),
+    ("subagent_finished", "notify_subagent_finished", "Subagent finished"),
+)
+
+# Integrations surfaced in the submenu, paired with their installer/remover so a
+# single handler can add or remove any agent by name.
+INTEGRATIONS: tuple[tuple[str, str], ...] = (
+    ("claude-code", "Claude Code"),
+    ("codex", "Codex"),
+    ("pi", "pi"),
+)
+# Registry keyed by agent → the module-level installer/remover *names*. They are
+# resolved via ``globals()`` at call time (rather than captured here) so tests can
+# patch ``agent_voice.menubar.install_*`` and have the handler honor the patch.
+INTEGRATION_INSTALLERS = {
+    "claude-code": "install_claude_code_personal",
+    "codex": "install_codex_personal",
+    "pi": "install_pi_personal",
+}
+INTEGRATION_REMOVERS = {
+    "claude-code": "remove_claude_code_personal",
+    "codex": "remove_codex_personal",
+    "pi": "remove_pi_personal",
+}
 
 
 MENU_BAR_ICON_SIZE = 22.0
@@ -386,6 +434,10 @@ class AgentVoiceMenuBar(NSObject):
         self._add_voice_engine_items(menu, config)
         menu.addItem_(NSMenuItem.separatorItem())
 
+        self._add_announce_events_submenu(menu, config)
+        self._add_integrations_submenu(menu, config)
+        menu.addItem_(NSMenuItem.separatorItem())
+
         self._add_dashboard_items(menu, config)
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -424,7 +476,37 @@ class AgentVoiceMenuBar(NSObject):
             last_label = "Last spoken: —"
         menu.addItem_(self._item(last_label, enabled=False))
 
+        self._add_voice_backend_submenu(menu, config)
+        # Surface the key-update affordance prominently when an OpenAI delivery
+        # quietly fell back to macOS say — that almost always means a bad/missing
+        # key, and the fix is to re-enter it.
+        if last_channel == "macos_say" and config.voice_backend == "openai_tts":
+            menu.addItem_(self._item("Update OpenAI API key…", "updateOpenAIKey:"))
+
         self._add_picker_items(menu, config)
+
+    @_python_method
+    def _add_voice_backend_submenu(self, menu: object, config) -> None:
+        current = config.voice_backend
+        label = VOICE_BACKEND_LABELS.get(current, current)
+        parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f"Voice engine: {label}", None, ""
+        )
+        submenu = NSMenu.alloc().init()
+        for backend, backend_label in VOICE_BACKEND_LABELS.items():
+            child = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                backend_label, "selectVoiceBackend:", ""
+            )
+            child.setTarget_(self)
+            child.setRepresentedObject_(backend)
+            child.setState_(1 if backend == current else 0)
+            submenu.addItem_(child)
+        # Always offer the key-update item inside the engine submenu so it can be
+        # refreshed even when delivery has not fallen back yet.
+        submenu.addItem_(NSMenuItem.separatorItem())
+        submenu.addItem_(self._item("Update OpenAI API key…", "updateOpenAIKey:"))
+        parent.setSubmenu_(submenu)
+        menu.addItem_(parent)
 
     @_python_method
     def _add_picker_items(self, menu: object, config) -> None:
@@ -485,6 +567,51 @@ class AgentVoiceMenuBar(NSObject):
         interrupt_item.setTarget_(self)
         interrupt_item.setState_(1 if config.voice_interrupt_on_user_input else 0)
         menu.addItem_(interrupt_item)
+
+    @_python_method
+    def _add_announce_events_submenu(self, menu: object, config) -> None:
+        parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Announce events", None, ""
+        )
+        submenu = NSMenu.alloc().init()
+        for event_name, attr, label in EVENT_TOGGLES:
+            child = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, "toggleAnnounceEvent:", ""
+            )
+            child.setTarget_(self)
+            child.setRepresentedObject_(event_name)
+            child.setState_(1 if getattr(config, attr) else 0)
+            submenu.addItem_(child)
+        parent.setSubmenu_(submenu)
+        menu.addItem_(parent)
+
+    @_python_method
+    def _add_integrations_submenu(self, menu: object, config) -> None:
+        parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Integrations", None, ""
+        )
+        submenu = NSMenu.alloc().init()
+        wired = {row.agent: row.wired for row in self._inspect_wiring(config)}
+        for agent, label in INTEGRATIONS:
+            is_wired = bool(wired.get(agent))
+            title = f"{label}: {'wired' if is_wired else 'not wired'}"
+            child = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, "toggleIntegration:", ""
+            )
+            child.setTarget_(self)
+            child.setRepresentedObject_(agent)
+            child.setState_(1 if is_wired else 0)
+            submenu.addItem_(child)
+        parent.setSubmenu_(submenu)
+        menu.addItem_(parent)
+
+    @_python_method
+    def _inspect_wiring(self, config) -> list:
+        try:
+            return inspect_agent_wiring(config)
+        except Exception as exc:
+            self._log(f"Integration wiring read failed: {exc}")
+            return []
 
     @_python_method
     def _hotkey_submenu_item(self, config) -> object:
@@ -825,6 +952,151 @@ class AgentVoiceMenuBar(NSObject):
         self._restart_daemon_if_running()
         self._log(f"TTS model set to {model}")
         self.refresh()
+
+    def selectVoiceBackend_(self, sender) -> None:
+        backend = str(sender.representedObject())
+        config = self._config()
+        if backend == config.voice_backend:
+            return
+        if backend == "openai_tts" and not get_openai_secret_status(config).available:
+            # Switching to OpenAI without a usable key would silently fall back to
+            # say. Prompt for one first and only commit the backend if it sticks.
+            if not self._prompt_and_store_openai_key():
+                self._log("Voice engine unchanged (no OpenAI key provided)")
+                self.refresh()
+                return
+            config = self._config()
+        voice = config.voice_name
+        if not voice or voice in VOICE_BACKEND_DEFAULT_VOICE.values():
+            # Carry over a sensible default voice when crossing backends, since
+            # macOS and OpenAI voice names are disjoint.
+            voice = VOICE_BACKEND_DEFAULT_VOICE.get(backend, voice)
+        set_voice_config(config.config_path, backend=backend, voice=voice)
+        self._restart_daemon_if_running()
+        self._log(f"Voice engine set to {VOICE_BACKEND_LABELS.get(backend, backend)}")
+        self.refresh()
+
+    def updateOpenAIKey_(self, sender) -> None:
+        if self._prompt_and_store_openai_key():
+            self._restart_daemon_if_running()
+        self.refresh()
+
+    @_python_method
+    def _prompt_and_store_openai_key(self) -> bool:
+        """Prompt for an OpenAI key, validate it, and store it in the Keychain.
+
+        Returns True when a key was validated and saved. Returns False on cancel,
+        empty input, validation failure, or when the alert UI is unavailable —
+        the caller decides whether to commit a dependent change (e.g. the backend
+        switch). Restarting the daemon is left to the caller.
+        """
+        key = self._prompt_openai_key()
+        if not key:
+            return False
+        config = self._config()
+        validation = validate_openai_tts_key(config, key)
+        if not validation.ok:
+            self._log(f"OpenAI key validation failed: {validation.error}")
+            self._alert_message(
+                "OpenAI key rejected",
+                validation.error or "The key could not generate test audio.",
+            )
+            return False
+        try:
+            set_openai_keychain_secret(config, key)
+        except RuntimeError as exc:
+            self._log(f"Could not save OpenAI key: {exc}")
+            self._alert_message(
+                "Could not save OpenAI key",
+                f"{exc}\n\nPut it in ~/.voiccce/.env as OPENAI_API_KEY=... instead.",
+            )
+            return False
+        self._log("OpenAI key saved to macOS Keychain")
+        return True
+
+    @_python_method
+    def _prompt_openai_key(self) -> str | None:
+        if NSAlert is None or NSTextField is None:
+            return None
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("OpenAI API key")
+        alert.setInformativeText_(
+            "Paste an OpenAI API key. It is validated with a short TTS generation "
+            "and stored in your macOS Keychain."
+        )
+        alert.addButtonWithTitle_("Save")
+        alert.addButtonWithTitle_("Cancel")
+        field = NSTextField.alloc().initWithFrame_(((0.0, 0.0), (280.0, 24.0)))
+        field.setStringValue_("")
+        alert.setAccessoryView_(field)
+        if alert.runModal() != NS_ALERT_FIRST_BUTTON_RETURN:
+            return None
+        return str(field.stringValue()).strip() or None
+
+    @_python_method
+    def _alert_message(self, title: str, detail: str) -> None:
+        if NSAlert is None:
+            return
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(detail)
+        alert.addButtonWithTitle_("OK")
+        alert.runModal()
+
+    def toggleAnnounceEvent_(self, sender) -> None:
+        event_name = str(sender.representedObject())
+        attr = next((a for name, a, _ in EVENT_TOGGLES if name == event_name), None)
+        if attr is None:
+            self._log(f"Unknown announce-event toggle '{event_name}'")
+            return
+        config = self._config()
+        new_value = not getattr(config, attr)
+        set_events_config(config.config_path, **{event_name: new_value})
+        self._restart_daemon_if_running()
+        self._log(f"Announce {event_name} {'enabled' if new_value else 'disabled'}")
+        self.refresh()
+
+    def toggleIntegration_(self, sender) -> None:
+        agent = str(sender.representedObject())
+        config = self._config()
+        wired = {row.agent: row.wired for row in self._inspect_wiring(config)}
+        if wired.get(agent):
+            self._remove_integration(agent)
+        else:
+            self._add_integration(agent)
+        self.refresh()
+
+    @_python_method
+    def _add_integration(self, agent: str) -> None:
+        installer_name = INTEGRATION_INSTALLERS.get(agent)
+        if installer_name is None:
+            self._log(f"Unknown integration '{agent}'")
+            return
+        installer = globals()[installer_name]
+        try:
+            installer(config_path=self._config().config_path)
+        except Exception as exc:
+            self._log(f"Could not wire {agent}: {exc}")
+            self._alert_message(f"Could not wire {agent}", str(exc))
+            return
+        self._restart_daemon_if_running()
+        self._log(f"Wired integration {agent}")
+
+    @_python_method
+    def _remove_integration(self, agent: str) -> None:
+        remover_name = INTEGRATION_REMOVERS.get(agent)
+        if remover_name is None:
+            self._log(f"Unknown integration '{agent}'")
+            return
+        remover = globals()[remover_name]
+        try:
+            remover()
+        except Exception as exc:
+            self._log(f"Could not remove {agent}: {exc}")
+            self._alert_message(f"Could not remove {agent}", str(exc))
+            return
+        self._restart_daemon_if_running()
+        self._log(f"Removed integration {agent}")
 
     def voiceSpeedChanged_(self, sender) -> None:
         speed = menu_voice_speed_value(float(sender.doubleValue()))

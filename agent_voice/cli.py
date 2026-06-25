@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from datetime import datetime
 from importlib import metadata
@@ -14,31 +16,65 @@ from pathlib import Path
 from typing import TypeVar
 from urllib.parse import unquote, urlparse
 
+from . import _resolve_version
 from .config import (
     AgentVoiceConfig,
+    ConfigError,
+    SUMMARY_PRIVACY_LEVELS,
     language_display_name,
     load_config,
     normalize_language,
+    reset_config,
+    set_autostart_managed,
     set_config_language,
+    set_daemon_config,
+    set_events_config,
     set_hotkey_config,
+    set_limits_config,
+    set_summary_config,
     set_voice_config,
     write_default_config,
 )
 from .hotkey import DEFAULT_STOP_SPEAKING_HOTKEY, HOTKEY_PRESETS, format_hotkey_display
-from .daemon import process_once, run_daemon
-from .db import connect, init_db
+from .daemon import in_quiet_hours, process_once, run_daemon
+from .db import (
+    clear_events,
+    clear_notifications,
+    clear_session_states,
+    connect,
+    db_size_bytes,
+    init_db,
+    prune_processed_events,
+    vacuum_db,
+)
 from .delivery import DeliveryRouter, test_message
+from .doctor import (
+    CheckResult,
+    doctor_ok,
+    inspect_agent_wiring,
+    run_doctor,
+)
 from .hooks.claude_event_collector import read_event_from_stdin as read_claude_event_from_stdin
 from .hooks.codex_event_collector import read_event_from_stdin as read_codex_event_from_stdin
 from .hooks.pi_event_collector import read_event_from_stdin as read_pi_event_from_stdin
 from .installer import WrapperImportError
-from .installer.claude_code import install_claude_code_personal
-from .installer.codex import install_codex_personal
-from .installer.pi import install_pi_personal
+from .installer.claude_code import install_claude_code_personal, remove_claude_code_personal
+from .installer.codex import install_codex_personal, remove_codex_personal
+from .installer.pi import install_pi_personal, remove_pi_personal
+from .intelligence.pipeline_log import pipeline_log_path, truncate_pipeline_log
+from .launchagent import (
+    DAEMON_LABEL,
+    MENUBAR_LABEL,
+    autostart_status,
+    disable_autostart,
+    enable_autostart,
+    plist_path,
+)
 from .models import EventType, NormalizedEvent
 from .queue import enqueue_event
 from .runtime import (
     clear_voice_mute,
+    parse_age_seconds,
     parse_duration_seconds,
     set_voice_mute,
     stop_speaking,
@@ -53,12 +89,19 @@ from .secrets import (
     set_openai_keychain_secret,
     validate_openai_tts_key,
 )
-from .ui import Choice, checkbox_select, select_one
+from .teardown import (
+    TeardownPlan,
+    TeardownReport,
+    detect_wired_integrations,
+    run_teardown,
+)
+from .ui import Choice, checkbox_select, confirm, select_one
 from .service import (
     daemon_status,
     menubar_service_paths,
     menubar_status,
     service_paths,
+    stale_pid_warnings,
     start_daemon,
     start_menubar,
     stop_daemon,
@@ -95,6 +138,45 @@ _DEFAULT_VOICE = {"openai_tts": "marin", "macos_say": "Alex"}
 # which maps cancel to its default).
 _YES_NO: list[Choice] = [Choice("yes", "Yes"), Choice("no", "No")]
 
+# Remote install/update source used when no local checkout is present and no
+# --source is given. ``DEFAULT_UPDATE_REF`` is the git ref pinned by default.
+REPO_GIT_URL = "git+https://github.com/blackbalancef/voiccce"
+DEFAULT_UPDATE_REF = "main"
+
+# Toggle tokens accepted by on/off-style config flags.
+_ON_TOKENS = {"on", "true", "yes", "1", "enable", "enabled"}
+_OFF_TOKENS = {"off", "false", "no", "0", "disable", "disabled"}
+
+# Event names accepted by `voiccce config --event NAME=on|off`, mapped to the
+# set_events_config keyword. These mirror agent_voice.config.set_events_config.
+_EVENT_FLAG_NAMES = (
+    "task_finished",
+    "permission_needed",
+    "input_needed",
+    "task_failed",
+    "subagent_finished",
+)
+
+# Which integrations `voiccce uninstall <target>` can unwire on its own, mapped
+# to the module-level name of the installer remover that strips that
+# integration's hooks + wrapper. Names (not the functions) are stored so the
+# handler resolves them via the module namespace at call time and stays
+# patchable in tests.
+_UNINSTALL_REMOVER_NAMES: dict[str, str] = {
+    "claude-code": "remove_claude_code_personal",
+    "codex": "remove_codex_personal",
+    "pi": "remove_pi_personal",
+}
+
+# Installers used to RE-APPLY hooks after a successful update, keyed by the names
+# teardown.detect_wired_integrations returns; values are module-level names,
+# resolved at call time so tests can patch them.
+_REAPPLY_INSTALLER_NAMES: dict[str, str] = {
+    "claude-code": "install_claude_code_personal",
+    "codex": "install_codex_personal",
+    "pi": "install_pi_personal",
+}
+
 # Words that mean "turn the stop-speaking hotkey off" when passed to --hotkey.
 _HOTKEY_OFF_TOKENS = {"off", "none", "no", "disable", "disabled", "false", "0", ""}
 # Short hints shown beside each preset in the setup picker.
@@ -118,6 +200,13 @@ def main(argv: list[str] | None = None) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="voiccce")
     parser.add_argument("--config", help="Path to config.toml")
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"voiccce {_resolve_version()}",
+        help="Show the installed Voiccce version and exit",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     install = subparsers.add_parser("install", help="Create local config and database")
@@ -193,15 +282,35 @@ def build_parser() -> argparse.ArgumentParser:
     stop = subparsers.add_parser("stop", help="Stop background daemon")
     stop.set_defaults(handler=cmd_stop)
 
-    update = subparsers.add_parser("update", help="Update this installation from a local checkout")
+    update = subparsers.add_parser("update", help="Update this installation (local checkout or git)")
     update.add_argument(
         "--source",
         help="Path to the voiccce checkout. Defaults to the current directory or the original install source.",
     )
     update.add_argument(
+        "--ref",
+        default=DEFAULT_UPDATE_REF,
+        help=f"Git ref to install when updating from {REPO_GIT_URL} (default: {DEFAULT_UPDATE_REF}).",
+    )
+    update.add_argument(
+        "--dev",
+        action="store_true",
+        help="Install the source checkout in editable mode (-e) for local development.",
+    )
+    update.add_argument(
         "--no-restart",
         action="store_true",
         help="Do not restart daemon/menu bar after updating.",
+    )
+    update.add_argument(
+        "--no-hooks",
+        action="store_true",
+        help="Do not re-apply hooks for wired integrations after updating.",
+    )
+    update.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="Skip the post-update health probe (enqueue + process a test event).",
     )
     update.set_defaults(handler=cmd_update)
 
@@ -248,6 +357,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--hotkey",
         help="Global stop-speaking hotkey, e.g. 'alt+cmd+s' or 'ctrl+alt+cmd+.'; use 'off' to disable",
     )
+    config_cmd.add_argument("--summary", choices=["on", "off"], help="Enable or disable AI summaries")
+    config_cmd.add_argument(
+        "--summary-privacy",
+        choices=list(SUMMARY_PRIVACY_LEVELS),
+        help="How much of the assistant's last message summaries may send",
+    )
+    config_cmd.add_argument("--summary-model", help="Summary model, e.g. gpt-5.4-nano")
+    config_cmd.add_argument("--summary-provider", help="Summary provider, e.g. openai or fallback")
+    config_cmd.add_argument(
+        "--summary-pipeline-log",
+        choices=["on", "off"],
+        help="Write the summary pipeline log (summary.log)",
+    )
+    config_cmd.add_argument(
+        "--event",
+        dest="events",
+        action="append",
+        metavar="NAME=on|off",
+        help=(
+            "Toggle an event notification, e.g. --event subagent_finished=on. "
+            "Names: " + ", ".join(_EVENT_FLAG_NAMES) + ". Repeatable."
+        ),
+    )
+    config_cmd.add_argument("--max-events-per-minute", type=int, help="Rate-limit notifications per minute")
+    config_cmd.add_argument("--daily-spend-cap", type=float, help="Daily spend cap in USD (0 = no cap)")
+    config_cmd.add_argument("--monthly-spend-cap", type=float, help="Monthly spend cap in USD (0 = no cap)")
+    config_cmd.add_argument("--event-retention-days", type=int, help="Days to keep processed events (0 = forever)")
+    config_cmd.add_argument(
+        "--interrupt-on-reply",
+        choices=["on", "off"],
+        help="Stop the current announcement when you reply into that session",
+    )
+    config_cmd.add_argument("--reset", action="store_true", help="Reset config to defaults (a backup is written)")
+    config_cmd.add_argument("--reset-section", help="Only reset this section (use with --reset), e.g. summary")
     config_cmd.set_defaults(handler=cmd_config)
 
     secret = subparsers.add_parser("secret", help="Manage local secrets in macOS Keychain")
@@ -262,7 +405,73 @@ def build_parser() -> argparse.ArgumentParser:
     secret_delete.add_argument("name", choices=["openai"])
     secret_delete.set_defaults(handler=cmd_secret_delete)
 
-    daemon = subparsers.add_parser("daemon", help="Run daemon")
+    doctor = subparsers.add_parser("doctor", help="Run health checks on the installation")
+    doctor.add_argument(
+        "--no-validate-key",
+        action="store_true",
+        help="Skip the live OpenAI key validation (offline/CI friendly)",
+    )
+    doctor.add_argument("--json", action="store_true", dest="as_json", help="Print machine-readable JSON")
+    doctor.set_defaults(handler=cmd_doctor)
+
+    logs = subparsers.add_parser("logs", help="Tail a Voiccce log file")
+    logs_source = logs.add_mutually_exclusive_group()
+    logs_source.add_argument("--daemon", action="store_const", const="daemon", dest="log_source", help="Daemon log (default)")
+    logs_source.add_argument("--menubar", action="store_const", const="menubar", dest="log_source", help="Menu bar log")
+    logs_source.add_argument("--hook", action="store_const", const="hook", dest="log_source", help="Hook log")
+    logs_source.add_argument("--summary", action="store_const", const="summary", dest="log_source", help="Summary pipeline log")
+    logs.add_argument("-n", type=int, default=50, dest="lines", help="Number of lines to show (default 50)")
+    logs.add_argument("-f", action="store_true", dest="follow", help="Follow the log (best-effort tail -f)")
+    logs.set_defaults(handler=cmd_logs, log_source="daemon")
+
+    prune = subparsers.add_parser("prune", help="Delete old processed events and reclaim space")
+    prune.add_argument(
+        "--older-than",
+        dest="older_than",
+        help="Age cutoff like 30d, 12h, 90m (bare number = seconds). "
+        "Defaults to the configured event retention.",
+    )
+    prune.set_defaults(handler=cmd_prune)
+
+    clear = subparsers.add_parser("clear", help="Clear queued events and/or notification history")
+    clear.add_argument("--events", action="store_true", help="Clear queued/processed events")
+    clear.add_argument("--history", action="store_true", help="Clear notification + session history and pipeline log")
+    clear.add_argument("--all", action="store_true", dest="clear_all", help="Clear events and history")
+    clear.add_argument("--yes", action="store_true", help="Do not prompt for confirmation")
+    clear.set_defaults(handler=cmd_clear)
+
+    autostart = subparsers.add_parser("autostart", help="Manage macOS login autostart (launchd)")
+    autostart_sub = autostart.add_subparsers(dest="autostart_command")
+    autostart_enable = autostart_sub.add_parser("enable", help="Install and load the autostart agents")
+    autostart_enable.set_defaults(handler=cmd_autostart_enable)
+    autostart_disable = autostart_sub.add_parser("disable", help="Unload and remove the autostart agents")
+    autostart_disable.set_defaults(handler=cmd_autostart_disable)
+    autostart_status_cmd = autostart_sub.add_parser("status", help="Show autostart agent status")
+    autostart_status_cmd.set_defaults(handler=cmd_autostart_status)
+
+    uninstall = subparsers.add_parser(
+        "uninstall",
+        help="Remove one integration's hooks, or tear down everything",
+    )
+    uninstall.add_argument(
+        "target",
+        nargs="?",
+        choices=["claude-code", "codex", "pi"],
+        help="Only unwire this integration. Omit to tear down the whole install.",
+    )
+    uninstall.add_argument("--purge", action="store_true", help="Also delete ~/.voiccce (off by default)")
+    uninstall.add_argument(
+        "--restore-backups",
+        action="store_true",
+        help="Restore each integration's most recent pre-install backup",
+    )
+    uninstall.add_argument("--yes", action="store_true", help="Do not prompt for confirmation")
+    uninstall.set_defaults(handler=cmd_uninstall)
+
+    # Internal commands invoked by the daemon launcher and generated hook
+    # wrappers, not by users: omitting ``help`` hides them from the help body
+    # (they remain reachable in the choices metavar).
+    daemon = subparsers.add_parser("daemon")  # internal
     daemon.add_argument("--once", action="store_true", help="Process one batch and exit")
     daemon.add_argument("--no-deliver", action="store_true", help="Create notification records without delivery")
     daemon.add_argument("--terminal-only", action="store_true", help="Deliver only to terminal log")
@@ -276,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--limit", type=int, default=20)
     events.set_defaults(handler=cmd_events)
 
-    collect = subparsers.add_parser("collect", help="Read a hook payload from stdin and enqueue it")
+    collect = subparsers.add_parser("collect")  # internal
     collect.add_argument("agent", choices=["claude-code", "codex", "pi"])
     collect.add_argument(
         "--hook",
@@ -294,7 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.set_defaults(handler=cmd_collect)
 
-    enqueue_test = subparsers.add_parser("enqueue-test-event", help="Enqueue a synthetic event")
+    enqueue_test = subparsers.add_parser("enqueue-test-event")  # internal
     enqueue_test.add_argument("--type", default=EventType.TASK_FINISHED.value)
     enqueue_test.add_argument("--project", default="voiccce")
     enqueue_test.add_argument("--session", default="test-session")
@@ -328,6 +537,12 @@ def _pi_install_kwargs(args: argparse.Namespace) -> dict[str, Path]:
     return kwargs
 
 
+def _warn_non_macos() -> None:
+    """Print a one-line warning when not on macOS, where voice playback works."""
+    if sys.platform != "darwin":
+        print("! Voiccce targets macOS; voice needs say/afplay, which are macOS tools.")
+
+
 def cmd_install(args: argparse.Namespace) -> None:
     try:
         _cmd_install(args)
@@ -336,6 +551,7 @@ def cmd_install(args: argparse.Namespace) -> None:
 
 
 def _cmd_install(args: argparse.Namespace) -> None:
+    _warn_non_macos()
     if args.target == "claude-code":
         result = install_claude_code_personal(verify=True, **_claude_install_kwargs(args))
         print(f"Claude Code personal settings: {result.settings_path}")
@@ -383,6 +599,8 @@ def cmd_setup(args: argparse.Namespace) -> None:
     config_path = write_default_config(args.config)
     config = load_config(config_path)
 
+    _warn_non_macos()
+
     # ── gather every interactive decision up front, then execute ──────────────
     targets = _resolve_setup_targets(args.target)
     if not targets:
@@ -417,6 +635,11 @@ def cmd_setup(args: argparse.Namespace) -> None:
         print(f"✓ Voice backend: openai_tts (voice: {voice})")
 
     _apply_stop_hotkey(config_path, hotkey_choice)
+
+    print(
+        "Privacy: openai_tts summaries send the assistant's last message to OpenAI; "
+        "limit this with `voiccce config --summary-privacy metadata_only`."
+    )
 
     installed: list[str] = []
     if "claude-code" in targets:
@@ -737,6 +960,28 @@ def _maybe_setup_menubar(config: AgentVoiceConfig, *, choice: bool | None) -> No
     print(f"✓ Menu bar started (pid {pid})")
 
 
+def format_bytes(num_bytes: int) -> str:
+    """Render a byte count as a short human-readable size (e.g. ``1.2 MB``)."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"  # pragma: no cover - unreachable, loop returns first
+
+
+def _last_delivered_at(conn: sqlite3.Connection) -> int | None:
+    """Epoch seconds of the most recently delivered notification, or ``None``."""
+    row = conn.execute(
+        "SELECT MAX(delivered_at) FROM notifications WHERE delivered_at IS NOT NULL"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     conn = connect(config.database_path)
@@ -751,10 +996,12 @@ def cmd_status(args: argparse.Namespace) -> None:
         pending = counts.get("pending", 0)
         processed = counts.get("processed", 0)
         usage_stats = fetch_usage_stats(conn)
+        last_delivered = _last_delivered_at(conn)
     finally:
         conn.close()
     print("Voiccce")
-    print(f"Database: {config.database_path}")
+    print(f"Version: {_resolve_version()}")
+    print(f"Database: {config.database_path} ({format_bytes(db_size_bytes(config.database_path))})")
     print(f"Queue pending: {pending}")
     print(f"Queue processed: {processed}")
     print(f"Queue failed: {failed}")
@@ -787,15 +1034,39 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(f"Audio billed: {format_usd(usage_stats.audio_billed_cost_usd)}")
     print(f"Summaries cost: {format_usd(usage_stats.summary_cost_usd)}")
     print(f"Reports listened: {usage_stats.reports_listened_count}")
-    print("Adapters: claude-code, codex collectors available")
+    if last_delivered is not None:
+        delivered_at = datetime.fromtimestamp(last_delivered).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"Last delivered: {delivered_at}")
+    else:
+        print("Last delivered: never")
+    print("Agents:")
+    for wiring in inspect_agent_wiring(config):
+        if wiring.wired:
+            events = ", ".join(wiring.events) if wiring.events else "-"
+            print(f"  {wiring.agent}: wired ({events})")
+        else:
+            print(f"  {wiring.agent}: not wired ({wiring.detail})")
     summary_status = "disabled"
     if config.summary_enabled:
         summary_status = f"{config.summary_provider} / {config.summary_model}"
     print(f"Summary: {summary_status}")
+    if in_quiet_hours(config):
+        print(f"Quiet hours: active ({config.quiet_hours_from}-{config.quiet_hours_to})")
     pid, running = daemon_status(config)
     print(f"Daemon: {'running' if running else 'stopped'}" + (f" (pid {pid})" if pid else ""))
     menu_pid, menu_running = menubar_status(config)
     print(f"Menu bar: {'running' if menu_running else 'stopped'}" + (f" (pid {menu_pid})" if menu_pid else ""))
+    for label, stale_pid in stale_pid_warnings(config):
+        print(f"! Stale pid: {label} pid {stale_pid} is recorded but not running")
+    if config.autostart_managed:
+        status = autostart_status(config)
+        daemon_loaded = status.get(DAEMON_LABEL, {}).get("loaded")
+        menubar_loaded = status.get(MENUBAR_LABEL, {}).get("loaded")
+        print(
+            "Autostart: managed "
+            f"(daemon {'loaded' if daemon_loaded else 'not loaded'}, "
+            f"menu bar {'loaded' if menubar_loaded else 'not loaded'})"
+        )
 
 
 def cmd_daemon(args: argparse.Namespace) -> None:
@@ -822,17 +1093,36 @@ def cmd_stop(args: argparse.Namespace) -> None:
 
 
 def cmd_update(args: argparse.Namespace) -> None:
-    source = _resolve_update_source(args.source)
     config = load_config(args.config)
     daemon_pid, daemon_running = daemon_status(config)
     menubar_pid, menubar_running = menubar_status(config)
-    command = _update_install_command(source)
 
-    print(f"Updating Voiccce from: {source}")
-    completed = subprocess.run(command, cwd=str(source))
+    source = _resolve_update_source(args.source)
+    if source is not None:
+        target = str(source)
+        cwd = str(source)
+        print(f"Updating Voiccce from: {source}")
+    else:
+        target = f"{REPO_GIT_URL}@{args.ref}"
+        cwd = None
+        print(f"Updating Voiccce from: {target}")
+
+    before_version = _resolve_version()
+    command = _update_install_command(target, editable=bool(args.dev) and source is not None)
+    completed = subprocess.run(command, cwd=cwd)
     if completed.returncode != 0:
         raise SystemExit(f"Update failed with exit code {completed.returncode}.")
-    print("✓ Package updated")
+    after_version = _resolve_version()
+    if before_version == after_version:
+        print(f"✓ Package updated (already up to date at {after_version})")
+    else:
+        print(f"✓ Package updated ({before_version} → {after_version})")
+
+    if not args.no_hooks:
+        _reapply_wired_hooks(config)
+
+    if not args.no_probe:
+        _health_probe(config)
 
     if args.no_restart:
         if daemon_running or menubar_running:
@@ -851,7 +1141,67 @@ def cmd_update(args: argparse.Namespace) -> None:
         print("No running daemon/menu bar to restart.")
 
 
-def _resolve_update_source(source: str | None) -> Path:
+def _reapply_wired_hooks(config: AgentVoiceConfig) -> None:
+    """Regenerate hook wrappers for every currently-wired integration.
+
+    After a package upgrade the generated wrappers may reference a stale path or
+    interpreter; re-running the installer for each wired agent regenerates them.
+    Best-effort: a failure for one agent is reported but never aborts the update.
+    """
+    wired = detect_wired_integrations(config)
+    if not wired:
+        print("No wired integrations to re-apply hooks for.")
+        return
+    for target in wired:
+        installer_name = _REAPPLY_INSTALLER_NAMES.get(target)
+        if installer_name is None:  # pragma: no cover - detect_* only returns known names
+            continue
+        installer = globals()[installer_name]
+        try:
+            installer(config_path=config.config_path, verify=True)
+        except Exception as exc:
+            print(f"! Could not re-apply {target} hooks: {exc}")
+            continue
+        print(f"✓ Re-applied {target} hooks")
+
+
+def _health_probe(config: AgentVoiceConfig) -> None:
+    """Enqueue and process one synthetic event to confirm the pipeline still works."""
+    conn = connect(config.database_path)
+    try:
+        init_db(conn)
+        event = NormalizedEvent.build(
+            agent_name="codex",
+            event_type=EventType.TASK_FINISHED.value,
+            project_name="voiccce",
+            session_id=f"update-probe-{int(time.time())}",
+        )
+        enqueue_event(conn, event)
+        result = process_once(conn, config, deliver=False)
+    except Exception as exc:
+        print(f"! Health probe failed: {exc}; check `voiccce doctor`.")
+        return
+    finally:
+        conn.close()
+    if result.processed_events:
+        print("✓ Health probe processed a test event")
+    else:
+        print("! Health probe did not process the test event; check `voiccce doctor`.")
+
+    _, daemon_running = daemon_status(config)
+    if not daemon_running and not stale_pid_warnings(config):
+        return
+    for label, stale_pid in stale_pid_warnings(config):
+        print(f"! Service {label} did not recover (stale pid {stale_pid}); run `voiccce start`.")
+
+
+def _resolve_update_source(source: str | None) -> Path | None:
+    """Resolve the local checkout to update from, or ``None`` to use the git URL.
+
+    An explicit ``--source`` must be a valid checkout (raises otherwise). With no
+    flag, prefer the current directory, then the recorded install source; when
+    neither is a checkout, return ``None`` so the caller updates from git.
+    """
     if source:
         return _validate_update_source(Path(source).expanduser())
 
@@ -863,10 +1213,7 @@ def _resolve_update_source(source: str | None) -> Path:
     if installed_source is not None and _is_update_source(installed_source):
         return installed_source.resolve()
 
-    raise SystemExit(
-        "Could not find a local voiccce checkout. Run `voiccce update` from the repo "
-        "or pass `--source /path/to/voiccce`."
-    )
+    return None
 
 
 def _validate_update_source(source: Path) -> Path:
@@ -901,15 +1248,22 @@ def _installed_source_path() -> Path | None:
     return Path(unquote(parsed.path)).expanduser()
 
 
-def _update_install_command(source: Path) -> list[str]:
-    pip_args = [
-        "install",
-        "--force-reinstall",
-        "--no-deps",
-        "-e",
-        str(source),
-    ]
+def _update_install_command(target: str, *, editable: bool = False) -> list[str]:
+    """Build the install command for ``target`` (a checkout path or git URL spec).
+
+    Prefer ``pipx install --force <target>`` when running inside a pipx-managed
+    venv so the app's own venv is reinstalled (non-editable, letting pip resolve
+    dependencies). For an editable dev install (``--dev`` on a local checkout) or
+    when pipx is unavailable, fall back to ``pip install --force-reinstall``. The
+    unconditional ``--no-deps`` was dropped so upgraded dependencies install too.
+    """
     pipx_package = _pipx_package_name()
+    if pipx_package and shutil.which("pipx") and not editable:
+        return ["pipx", "install", "--force", target]
+    pip_args = ["install", "--force-reinstall"]
+    if editable:
+        pip_args.append("-e")
+    pip_args.append(target)
     if pipx_package and shutil.which("pipx"):
         return ["pipx", "runpip", pipx_package, *pip_args]
     return [sys.executable, "-m", "pip", *pip_args]
@@ -993,10 +1347,77 @@ def cmd_unmute(args: argparse.Namespace) -> None:
 
 def cmd_test(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    DeliveryRouter(config, terminal_only=args.terminal_only).deliver(test_message(config))
+    results = DeliveryRouter(config, terminal_only=args.terminal_only).deliver(test_message(config))
+    delivered = next((r for r in results if r.delivered), None)
+    if delivered is not None:
+        print(f"Test played via {delivered.channel}")
+        return
+    error = next((r.error for r in results if r.error), None)
+    print(f"Test failed: {error or 'no delivery channel succeeded'}")
+    hint = _test_remediation_hint(error)
+    if hint:
+        print(f"Hint: {hint}")
+    raise SystemExit(1)
+
+
+def _test_remediation_hint(error: str | None) -> str | None:
+    """Map a delivery error to a one-line remediation hint, or ``None``."""
+    if not error:
+        return None
+    lowered = error.lower()
+    if "mute" in lowered:
+        return "voice muted -> voiccce unmute"
+    if "http 401" in lowered or "invalid" in lowered or "api key" in lowered or "is not set" in lowered:
+        return "key invalid -> voiccce secret set openai"
+    if "afplay" in lowered:
+        return "afplay missing -> install it (ships with macOS); voiccce targets macOS"
+    if "say command not found" in lowered:
+        return "say missing -> voiccce targets macOS (say ships with macOS)"
+    return None
+
+
+def _toggle_flag(value: str | None, label: str) -> bool | None:
+    """Parse an on/off-style flag value into a bool, or ``None`` when unset."""
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in _ON_TOKENS:
+        return True
+    if lowered in _OFF_TOKENS:
+        return False
+    raise SystemExit(f"Invalid value for {label}: '{value}'. Use on or off.")
+
+
+def _parse_event_flags(specs: list[str] | None) -> dict[str, bool]:
+    """Parse ``--event NAME=on|off`` specs into ``{name: bool}``; validate names."""
+    flags: dict[str, bool] = {}
+    for spec in specs or []:
+        name, sep, raw = spec.partition("=")
+        name = name.strip()
+        if not sep:
+            raise SystemExit(f"Invalid --event '{spec}'. Use NAME=on or NAME=off.")
+        if name not in _EVENT_FLAG_NAMES:
+            raise SystemExit(
+                f"Unknown event '{name}'. Names: {', '.join(_EVENT_FLAG_NAMES)}."
+            )
+        toggled = _toggle_flag(raw, f"--event {name}")
+        if toggled is not None:
+            flags[name] = toggled
+    return flags
 
 
 def cmd_config(args: argparse.Namespace) -> None:
+    if args.reset:
+        config_path = write_default_config(args.config)
+        try:
+            backup_path = reset_config(config_path, args.reset_section)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        target = f"section [{args.reset_section}]" if args.reset_section else "config"
+        print(f"Reset {target} to defaults. Backup: {backup_path}")
+        print("Restart daemon to apply changes.")
+        return
+
     changed = False
     if args.language:
         try:
@@ -1035,6 +1456,57 @@ def cmd_config(args: argparse.Namespace) -> None:
                 raise SystemExit(f"Invalid hotkey '{args.hotkey}': {exc}")
         changed = True
 
+    summary_options: dict[str, object] = {}
+    summary_enabled = _toggle_flag(args.summary, "--summary")
+    if summary_enabled is not None:
+        summary_options["enabled"] = summary_enabled
+    if args.summary_privacy is not None:
+        summary_options["privacy_level"] = args.summary_privacy
+    if args.summary_model is not None:
+        summary_options["model"] = args.summary_model
+    if args.summary_provider is not None:
+        summary_options["provider"] = args.summary_provider
+    pipeline_log = _toggle_flag(args.summary_pipeline_log, "--summary-pipeline-log")
+    if pipeline_log is not None:
+        summary_options["pipeline_log"] = pipeline_log
+    if summary_options:
+        try:
+            config_path = set_summary_config(config_path, **summary_options)
+        except (ValueError, ConfigError) as exc:
+            raise SystemExit(str(exc))
+        changed = True
+
+    event_flags = _parse_event_flags(args.events)
+    if event_flags:
+        config_path = set_events_config(config_path, **event_flags)
+        changed = True
+
+    limits_options: dict[str, object] = {}
+    if args.max_events_per_minute is not None:
+        limits_options["max_events_per_minute"] = args.max_events_per_minute
+    if args.daily_spend_cap is not None:
+        limits_options["daily_spend_cap_usd"] = args.daily_spend_cap
+    if args.monthly_spend_cap is not None:
+        limits_options["monthly_spend_cap_usd"] = args.monthly_spend_cap
+    if limits_options:
+        try:
+            config_path = set_limits_config(config_path, **limits_options)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        changed = True
+
+    if args.event_retention_days is not None:
+        try:
+            config_path = set_daemon_config(config_path, event_retention_days=args.event_retention_days)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        changed = True
+
+    interrupt = _toggle_flag(args.interrupt_on_reply, "--interrupt-on-reply")
+    if interrupt is not None:
+        config_path = set_voice_config(config_path, interrupt_on_user_input=interrupt)
+        changed = True
+
     config = load_config(args.config)
     normalize_language(config.language)
     print(f"Config: {config.config_path}")
@@ -1062,6 +1534,16 @@ def cmd_config(args: argparse.Namespace) -> None:
     print(f"Summary text input price per 1M tokens: {format_usd(config.summary_text_input_price_per_million_tokens_usd)}")
     print(f"Summary cached input price per 1M tokens: {format_usd(config.summary_cached_input_price_per_million_tokens_usd)}")
     print(f"Summary text output price per 1M tokens: {format_usd(config.summary_text_output_price_per_million_tokens_usd)}")
+    print(f"Summary pipeline log: {'on' if config.summary_pipeline_log else 'off'}")
+    print(f"Interrupt on reply: {'on' if config.voice_interrupt_on_user_input else 'off'}")
+    quiet = "off"
+    if config.quiet_hours_enabled:
+        quiet = f"{config.quiet_hours_from}-{config.quiet_hours_to}"
+    print(f"Quiet hours: {quiet}")
+    print(f"Max events per minute: {config.max_events_per_minute}")
+    print(f"Daily spend cap: {format_usd(config.daily_spend_cap_usd) if config.daily_spend_cap_usd else 'none'}")
+    print(f"Monthly spend cap: {format_usd(config.monthly_spend_cap_usd) if config.monthly_spend_cap_usd else 'none'}")
+    print(f"Event retention days: {config.event_retention_days or 'forever'}")
     status = get_openai_secret_status(config)
     print(f"Voice API key status: {status.source if status.available else 'missing'}")
     if changed:
@@ -1178,6 +1660,261 @@ def cmd_secret_delete(args: argparse.Namespace) -> None:
     if args.name == "openai":
         deleted = delete_openai_keychain_secret(config)
         print("OpenAI API key deleted from macOS Keychain." if deleted else "OpenAI API key was not in Keychain.")
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    results = run_doctor(config, validate_key=not args.no_validate_key)
+    if args.as_json:
+        print(_doctor_json(results))
+    else:
+        for result in results:
+            mark = "PASS" if result.ok else "FAIL"
+            print(f"[{mark}] {result.name}: {result.detail}")
+            if not result.ok and result.hint:
+                print(f"       hint: {result.hint}")
+    if not doctor_ok(results):
+        raise SystemExit(1)
+
+
+def _doctor_json(results: list[CheckResult]) -> str:
+    payload = {
+        "ok": doctor_ok(results),
+        "checks": [
+            {"name": r.name, "ok": r.ok, "detail": r.detail, "hint": r.hint}
+            for r in results
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def cmd_logs(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    log_path = _log_path_for(config, args.log_source)
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        print(f"No {args.log_source} log yet at {log_path}.")
+        return
+    print(f"=== {args.log_source} log: {log_path} ===")
+    for line in _tail_lines(log_path, args.lines):
+        print(line)
+    if args.follow:
+        _follow_log(log_path)
+
+
+def _log_path_for(config: AgentVoiceConfig, source: str) -> Path:
+    if source == "menubar":
+        return menubar_service_paths(config).log_path
+    if source == "hook":
+        return config.config_path.parent / "hook.log"
+    if source == "summary":
+        return pipeline_log_path(config)
+    return service_paths(config).log_path
+
+
+def _tail_lines(path: Path, count: int) -> list[str]:
+    """Return the last ``count`` lines of ``path`` (best-effort, full read)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [f"(could not read log: {exc})"]
+    lines = text.splitlines()
+    if count <= 0:
+        return lines
+    return lines[-count:]
+
+
+def _follow_log(path: Path) -> None:  # pragma: no cover - interactive, blocks on I/O
+    """Best-effort ``tail -f``: print new lines as they are appended."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(0, os.SEEK_END)
+            while True:
+                line = handle.readline()
+                if line:
+                    print(line.rstrip("\n"))
+                    continue
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        return
+    except OSError:
+        return
+
+
+def cmd_prune(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if args.older_than is not None:
+        try:
+            age_seconds = parse_age_seconds(args.older_than)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+    else:
+        age_seconds = max(0, config.event_retention_days) * 24 * 60 * 60
+        if age_seconds == 0:
+            print("Event retention is set to forever; nothing pruned. Pass --older-than to override.")
+            return
+    cutoff = int(time.time()) - age_seconds
+    size_before = db_size_bytes(config.database_path)
+    conn = connect(config.database_path)
+    try:
+        init_db(conn)
+        removed = prune_processed_events(conn, older_than_epoch=cutoff)
+        vacuum_db(conn)
+    finally:
+        conn.close()
+    size_after = db_size_bytes(config.database_path)
+    reclaimed = max(0, size_before - size_after)
+    print(f"Pruned {removed} processed event(s) older than {args.older_than or f'{config.event_retention_days}d'}.")
+    print(f"Reclaimed {format_bytes(reclaimed)} (database now {format_bytes(size_after)}).")
+
+
+def cmd_clear(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    clear_event_rows = args.events or args.clear_all
+    clear_history = args.history or args.clear_all
+    if not clear_event_rows and not clear_history:
+        raise SystemExit("Nothing to clear. Pass --events, --history, or --all.")
+
+    targets = []
+    if clear_event_rows:
+        targets.append("events")
+    if clear_history:
+        targets.append("notification + session history")
+    if not _confirm_destructive(f"Clear {', '.join(targets)}?", assume_yes=args.yes):
+        print("Aborted.")
+        return
+
+    conn = connect(config.database_path)
+    try:
+        init_db(conn)
+        if clear_event_rows:
+            removed = clear_events(conn)
+            print(f"Cleared {removed} event(s).")
+        if clear_history:
+            notifications = clear_notifications(conn)
+            sessions = clear_session_states(conn)
+            print(f"Cleared {notifications} notification(s) and {sessions} session state(s).")
+    finally:
+        conn.close()
+    if clear_history:
+        truncate_pipeline_log(config)
+        print("Cleared the summary pipeline log.")
+
+
+def _confirm_destructive(question: str, *, assume_yes: bool) -> bool:
+    """Return whether a destructive action may proceed.
+
+    ``--yes`` and non-interactive runs proceed without prompting; an interactive
+    TTY gets an arrow-key yes/no confirm defaulting to No.
+    """
+    if assume_yes or not _interactive():
+        return True
+    return confirm(question, default=False)
+
+
+def cmd_autostart_enable(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if sys.platform != "darwin":
+        print("! Autostart uses macOS launchd; not available on this platform.")
+        return
+    enabled = enable_autostart(config)
+    set_autostart_managed(config.config_path, True)
+    if enabled:
+        print("Enabled autostart for: " + ", ".join(enabled))
+    else:
+        print("! Could not load any autostart agents (is launchctl available?).")
+    for label in (DAEMON_LABEL, MENUBAR_LABEL):
+        print(f"  {label}: {plist_path(label)}")
+
+
+def cmd_autostart_disable(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if sys.platform != "darwin":
+        print("! Autostart uses macOS launchd; not available on this platform.")
+        return
+    removed = disable_autostart(config)
+    set_autostart_managed(config.config_path, False)
+    if removed:
+        print("Disabled autostart for: " + ", ".join(removed))
+    else:
+        print("Autostart was not installed.")
+
+
+def cmd_autostart_status(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if sys.platform != "darwin":
+        print("! Autostart uses macOS launchd; not available on this platform.")
+        return
+    status = autostart_status(config)
+    print(f"Autostart managed: {'yes' if config.autostart_managed else 'no'}")
+    for label in (DAEMON_LABEL, MENUBAR_LABEL):
+        info = status.get(label, {})
+        present = "present" if info.get("plist_present") else "absent"
+        loaded = "loaded" if info.get("loaded") else "not loaded"
+        print(f"  {label}: plist {present}, {loaded}")
+        print(f"    {plist_path(label)}")
+
+
+def cmd_uninstall(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if args.target is not None:
+        _uninstall_target(args.target)
+        return
+    _uninstall_all(config, args)
+
+
+def _uninstall_target(target: str) -> None:
+    remover_name = _UNINSTALL_REMOVER_NAMES.get(target)
+    if remover_name is None:  # pragma: no cover - argparse restricts choices
+        raise SystemExit(f"Unknown integration '{target}'.")
+    remover = globals()[remover_name]
+    result = remover()
+    if target == "pi":
+        print(f"pi extension removed: {result.extension_removed}")
+        print(f"  extension: {result.extension_path}")
+    else:
+        removed = ", ".join(result.removed_events) if result.removed_events else "none"
+        path = getattr(result, "settings_path", None) or getattr(result, "hooks_path", None)
+        print(f"Removed {target} hooks: {removed}")
+        print(f"  file: {path}")
+    print(f"  wrapper removed: {result.wrapper_removed}")
+    print(f"Left ~/.voiccce in place. Run `voiccce uninstall` (no target) to tear down everything.")
+
+
+def _uninstall_all(config: AgentVoiceConfig, args: argparse.Namespace) -> None:
+    wired = detect_wired_integrations(config)
+    summary = ", ".join(wired) if wired else "no wired integrations"
+    purge_note = " and DELETE ~/.voiccce" if args.purge else " (keeping ~/.voiccce)"
+    if not _confirm_destructive(
+        f"Tear down Voiccce ({summary}){purge_note}?", assume_yes=args.yes
+    ):
+        print("Aborted.")
+        return
+
+    plan = TeardownPlan(purge_data=args.purge, restore_backups=args.restore_backups)
+    report = run_teardown(config, plan)
+    _print_teardown_report(report)
+
+
+def _print_teardown_report(report: TeardownReport) -> None:
+    if report.stopped:
+        print("Stopped: " + ", ".join(report.stopped))
+    for agent, events in report.removed_hooks.items():
+        if isinstance(events, bool):
+            print(f"Removed {agent} hook: {events}")
+        else:
+            print(f"Removed {agent} hooks: {', '.join(events) if events else 'none'}")
+    if report.removed_wrappers:
+        print("Removed wrappers: " + ", ".join(report.removed_wrappers))
+    if report.removed_autostart:
+        print("Removed autostart: " + ", ".join(report.removed_autostart))
+    print(f"Keychain secret deleted: {report.keychain_deleted}")
+    if report.backups_restored:
+        print("Restored backups: " + ", ".join(report.backups_restored))
+    print(f"Data directory removed: {report.data_removed}")
+    for note in report.notes:
+        print(f"  note: {note}")
+    print("Finish removing the package with:")
+    print("  " + " ".join(report.package_command))
 
 
 if __name__ == "__main__":

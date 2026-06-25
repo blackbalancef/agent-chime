@@ -404,5 +404,234 @@ class HotkeyLifecycleTests(unittest.TestCase):
             self.assertEqual(controller._prompt_language("en"), "Spanish")
 
 
+@unittest.skipUnless(
+    menubar_module._IMPORT_ERROR is not None,
+    "drives the controller as a plain object; only valid when PyObjC is absent",
+)
+class CliMenuParityTests(unittest.TestCase):
+    """Exercise the CLI<->menu parity handlers without PyObjC.
+
+    As in ``HotkeyLifecycleTests``, when PyObjC is absent the controller is a
+    plain Python object whose handler methods can be invoked directly.
+    """
+
+    def _controller(self, config_path=None) -> AgentVoiceMenuBar:
+        controller = AgentVoiceMenuBar.__new__(AgentVoiceMenuBar)
+        controller.config_path = str(config_path) if config_path else None
+        controller.refresh = lambda: None
+        controller._restart_daemon_if_running = MagicMock()
+        return controller
+
+    # --- voice backend switch -------------------------------------------------
+
+    def test_select_voice_backend_persists_and_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            from agent_voice.config import set_voice_config
+
+            set_voice_config(config_path, backend="macos_say", voice="Alex")
+            controller = self._controller(config_path=config_path)
+            sender = SimpleNamespace(representedObject=lambda: "openai_tts")
+            with patch(
+                "agent_voice.menubar.get_openai_secret_status",
+                return_value=SimpleNamespace(available=True),
+            ):
+                controller.selectVoiceBackend_(sender)
+            config = load_config(config_path)
+            self.assertEqual(config.voice_backend, "openai_tts")
+            self.assertEqual(config.voice_name, "marin")  # carried default voice
+            controller._restart_daemon_if_running.assert_called_once()
+
+    def test_select_voice_backend_noop_when_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            controller = self._controller(config_path=config_path)
+            sender = SimpleNamespace(representedObject=lambda: "macos_say")
+            with patch("agent_voice.menubar.set_voice_config") as setter:
+                controller.selectVoiceBackend_(sender)
+            setter.assert_not_called()
+            controller._restart_daemon_if_running.assert_not_called()
+
+    def test_select_openai_backend_prompts_for_key_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            from agent_voice.config import set_voice_config
+
+            set_voice_config(config_path, backend="macos_say", voice="Alex")
+            controller = self._controller(config_path=config_path)
+            controller._prompt_and_store_openai_key = MagicMock(return_value=True)
+            sender = SimpleNamespace(representedObject=lambda: "openai_tts")
+            with patch(
+                "agent_voice.menubar.get_openai_secret_status",
+                return_value=SimpleNamespace(available=False),
+            ):
+                controller.selectVoiceBackend_(sender)
+            controller._prompt_and_store_openai_key.assert_called_once()
+            self.assertEqual(load_config(config_path).voice_backend, "openai_tts")
+
+    def test_select_openai_backend_aborts_when_key_prompt_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            from agent_voice.config import set_voice_config
+
+            set_voice_config(config_path, backend="macos_say", voice="Alex")
+            controller = self._controller(config_path=config_path)
+            controller._prompt_and_store_openai_key = MagicMock(return_value=False)
+            sender = SimpleNamespace(representedObject=lambda: "openai_tts")
+            with patch(
+                "agent_voice.menubar.get_openai_secret_status",
+                return_value=SimpleNamespace(available=False),
+            ):
+                controller.selectVoiceBackend_(sender)
+            self.assertEqual(load_config(config_path).voice_backend, "macos_say")
+            controller._restart_daemon_if_running.assert_not_called()
+
+    # --- OpenAI key prompt ----------------------------------------------------
+
+    def test_prompt_and_store_openai_key_validates_and_stores(self) -> None:
+        controller = self._controller()
+        controller._config = lambda: SimpleNamespace()
+        controller._prompt_openai_key = lambda: "sk-test"
+        with (
+            patch(
+                "agent_voice.menubar.validate_openai_tts_key",
+                return_value=SimpleNamespace(ok=True, error=None),
+            ) as validate,
+            patch("agent_voice.menubar.set_openai_keychain_secret") as store,
+        ):
+            self.assertTrue(controller._prompt_and_store_openai_key())
+        validate.assert_called_once()
+        store.assert_called_once()
+        self.assertEqual(store.call_args.args[1], "sk-test")
+
+    def test_prompt_and_store_openai_key_rejects_invalid(self) -> None:
+        controller = self._controller()
+        controller._config = lambda: SimpleNamespace()
+        controller._prompt_openai_key = lambda: "sk-bad"
+        controller._alert_message = MagicMock()
+        with (
+            patch(
+                "agent_voice.menubar.validate_openai_tts_key",
+                return_value=SimpleNamespace(ok=False, error="HTTP 401"),
+            ),
+            patch("agent_voice.menubar.set_openai_keychain_secret") as store,
+        ):
+            self.assertFalse(controller._prompt_and_store_openai_key())
+        store.assert_not_called()
+        controller._alert_message.assert_called_once()
+
+    def test_prompt_and_store_openai_key_cancel_returns_false(self) -> None:
+        controller = self._controller()
+        controller._config = lambda: SimpleNamespace()
+        controller._prompt_openai_key = lambda: None
+        with (
+            patch("agent_voice.menubar.validate_openai_tts_key") as validate,
+            patch("agent_voice.menubar.set_openai_keychain_secret") as store,
+        ):
+            self.assertFalse(controller._prompt_and_store_openai_key())
+        validate.assert_not_called()
+        store.assert_not_called()
+
+    def test_update_openai_key_restarts_when_stored(self) -> None:
+        controller = self._controller()
+        controller._prompt_and_store_openai_key = MagicMock(return_value=True)
+        controller.updateOpenAIKey_(None)
+        controller._restart_daemon_if_running.assert_called_once()
+
+    def test_update_openai_key_no_restart_when_cancelled(self) -> None:
+        controller = self._controller()
+        controller._prompt_and_store_openai_key = MagicMock(return_value=False)
+        controller.updateOpenAIKey_(None)
+        controller._restart_daemon_if_running.assert_not_called()
+
+    # --- announce-event toggles ----------------------------------------------
+
+    def test_toggle_announce_event_persists_and_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            controller = self._controller(config_path=config_path)
+            sender = SimpleNamespace(representedObject=lambda: "task_finished")
+            # Default config has task_finished enabled; toggling disables it.
+            controller.toggleAnnounceEvent_(sender)
+            self.assertFalse(load_config(config_path).notify_task_finished)
+            controller._restart_daemon_if_running.assert_called_once()
+            # Toggling again re-enables it.
+            controller.toggleAnnounceEvent_(sender)
+            self.assertTrue(load_config(config_path).notify_task_finished)
+
+    def test_toggle_announce_event_subagent_default_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            controller = self._controller(config_path=config_path)
+            sender = SimpleNamespace(representedObject=lambda: "subagent_finished")
+            controller.toggleAnnounceEvent_(sender)
+            self.assertTrue(load_config(config_path).notify_subagent_finished)
+
+    def test_toggle_announce_event_ignores_unknown(self) -> None:
+        controller = self._controller()
+        with patch("agent_voice.menubar.set_events_config") as setter:
+            controller.toggleAnnounceEvent_(
+                SimpleNamespace(representedObject=lambda: "bogus")
+            )
+        setter.assert_not_called()
+
+    # --- integrations add/remove ---------------------------------------------
+
+    def test_toggle_integration_installs_when_not_wired(self) -> None:
+        controller = self._controller()
+        controller._config = lambda: SimpleNamespace(config_path="/tmp/cfg.toml")
+        controller._inspect_wiring = lambda config: [
+            SimpleNamespace(agent="claude-code", wired=False)
+        ]
+        sender = SimpleNamespace(representedObject=lambda: "claude-code")
+        with patch("agent_voice.menubar.install_claude_code_personal") as installer:
+            controller.toggleIntegration_(sender)
+        installer.assert_called_once()
+        self.assertEqual(installer.call_args.kwargs["config_path"], "/tmp/cfg.toml")
+        controller._restart_daemon_if_running.assert_called_once()
+
+    def test_toggle_integration_removes_when_wired(self) -> None:
+        controller = self._controller()
+        controller._config = lambda: SimpleNamespace(config_path="/tmp/cfg.toml")
+        controller._inspect_wiring = lambda config: [
+            SimpleNamespace(agent="codex", wired=True)
+        ]
+        sender = SimpleNamespace(representedObject=lambda: "codex")
+        with patch("agent_voice.menubar.remove_codex_personal") as remover:
+            controller.toggleIntegration_(sender)
+        remover.assert_called_once()
+        controller._restart_daemon_if_running.assert_called_once()
+
+    def test_toggle_integration_pi_add_and_remove(self) -> None:
+        controller = self._controller()
+        controller._config = lambda: SimpleNamespace(config_path="/tmp/cfg.toml")
+        sender = SimpleNamespace(representedObject=lambda: "pi")
+        controller._inspect_wiring = lambda config: [
+            SimpleNamespace(agent="pi", wired=False)
+        ]
+        with patch("agent_voice.menubar.install_pi_personal") as installer:
+            controller.toggleIntegration_(sender)
+        installer.assert_called_once()
+
+        controller._inspect_wiring = lambda config: [
+            SimpleNamespace(agent="pi", wired=True)
+        ]
+        with patch("agent_voice.menubar.remove_pi_personal") as remover:
+            controller.toggleIntegration_(sender)
+        remover.assert_called_once()
+
+    def test_add_integration_surfaces_failure_without_restart(self) -> None:
+        controller = self._controller()
+        controller._config = lambda: SimpleNamespace(config_path="/tmp/cfg.toml")
+        controller._alert_message = MagicMock()
+        with patch(
+            "agent_voice.menubar.install_claude_code_personal",
+            side_effect=RuntimeError("boom"),
+        ):
+            controller._add_integration("claude-code")
+        controller._alert_message.assert_called_once()
+        controller._restart_daemon_if_running.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
