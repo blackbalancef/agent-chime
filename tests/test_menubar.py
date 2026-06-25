@@ -1,12 +1,18 @@
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+from agent_voice import menubar as menubar_module
+from agent_voice.config import load_config
 from agent_voice.menubar import (
     ACTIVITY_FRAME_INTERVAL_SECONDS,
     ACTIVITY_ICON_STATES,
     LEFT_MOUSE_DOWN_EVENT_TYPE,
     LEFT_MOUSE_DRAGGED_EVENT_TYPE,
     VOICE_SPEED_PRESETS,
+    AgentVoiceMenuBar,
     format_countdown,
     format_speed_preset,
     format_voice_speed,
@@ -155,6 +161,247 @@ class MenuBarTests(unittest.TestCase):
             0.125 * start[0] + 0.375 * control_1[0] + 0.375 * control_2[0] + 0.125 * end[0],
             0.125 * start[1] + 0.375 * control_1[1] + 0.375 * control_2[1] + 0.125 * end[1],
         )
+
+
+class _RecordingHotkey:
+    """Stand-in for GlobalHotkey that records register/unregister calls."""
+
+    def __init__(self) -> None:
+        self.registered_with = None
+        self.callback = None
+        self.unregister_calls = 0
+
+    def register(self, parsed, callback) -> None:
+        self.registered_with = parsed
+        self.callback = callback
+
+    def unregister(self) -> None:
+        self.unregister_calls += 1
+
+
+@unittest.skipUnless(
+    menubar_module._IMPORT_ERROR is not None,
+    "drives the controller as a plain object; only valid when PyObjC is absent",
+)
+class HotkeyLifecycleTests(unittest.TestCase):
+    """Exercise the menu bar's hotkey registration logic without PyObjC.
+
+    When PyObjC is unavailable the NSObject base collapses to ``object`` and the
+    ``@_python_method`` decorator is the identity, so the controller is a plain
+    Python object whose hotkey methods can be called directly.
+    """
+
+    def _controller(self, config_path=None) -> AgentVoiceMenuBar:
+        controller = AgentVoiceMenuBar.__new__(AgentVoiceMenuBar)
+        controller.config_path = str(config_path) if config_path else None
+        controller.hotkey = None
+        controller.hotkey_spec = None
+        controller.hotkey_enabled_state = None
+        controller.hotkey_display = ""
+        return controller
+
+    def _config(self, *, enabled=True, spec="alt+cmd+s", config_path=None):
+        return SimpleNamespace(
+            hotkey_enabled=enabled,
+            hotkey_stop_speaking=spec,
+            config_path=config_path,
+        )
+
+    def test_sync_registers_when_enabled(self) -> None:
+        created: list[_RecordingHotkey] = []
+        with (
+            patch("agent_voice.menubar.carbon_available", return_value=True),
+            patch("agent_voice.menubar.GlobalHotkey", side_effect=lambda: created.append(_RecordingHotkey()) or created[-1]),
+        ):
+            controller = self._controller()
+            controller._sync_hotkey(self._config())
+        self.assertEqual(len(created), 1)
+        self.assertIs(controller.hotkey, created[0])
+        self.assertEqual(created[0].registered_with.canonical, "alt+cmd+s")
+        self.assertEqual(controller.hotkey_display, "⌥⌘S")
+
+    def test_sync_is_noop_when_unchanged(self) -> None:
+        created: list[_RecordingHotkey] = []
+        with (
+            patch("agent_voice.menubar.carbon_available", return_value=True),
+            patch("agent_voice.menubar.GlobalHotkey", side_effect=lambda: created.append(_RecordingHotkey()) or created[-1]),
+        ):
+            controller = self._controller()
+            controller._sync_hotkey(self._config())
+            controller._sync_hotkey(self._config())  # identical → must not re-register
+        self.assertEqual(len(created), 1)
+
+    def test_sync_replaces_on_change(self) -> None:
+        created: list[_RecordingHotkey] = []
+        with (
+            patch("agent_voice.menubar.carbon_available", return_value=True),
+            patch("agent_voice.menubar.GlobalHotkey", side_effect=lambda: created.append(_RecordingHotkey()) or created[-1]),
+        ):
+            controller = self._controller()
+            controller._sync_hotkey(self._config(spec="alt+cmd+s"))
+            controller._sync_hotkey(self._config(spec="ctrl+alt+cmd+."))
+        self.assertEqual(len(created), 2)
+        self.assertEqual(created[0].unregister_calls, 1)  # old one torn down
+        self.assertEqual(created[1].registered_with.canonical, "ctrl+alt+cmd+.")
+        self.assertIs(controller.hotkey, created[1])
+
+    def test_sync_tears_down_when_disabled(self) -> None:
+        created: list[_RecordingHotkey] = []
+        with (
+            patch("agent_voice.menubar.carbon_available", return_value=True),
+            patch("agent_voice.menubar.GlobalHotkey", side_effect=lambda: created.append(_RecordingHotkey()) or created[-1]),
+        ):
+            controller = self._controller()
+            controller._sync_hotkey(self._config(enabled=True))
+            controller._sync_hotkey(self._config(enabled=False))
+        self.assertEqual(created[0].unregister_calls, 1)
+        self.assertIsNone(controller.hotkey)
+        self.assertEqual(controller.hotkey_display, "")
+
+    def test_sync_skips_invalid_spec(self) -> None:
+        with (
+            patch("agent_voice.menubar.carbon_available", return_value=True),
+            patch("agent_voice.menubar.GlobalHotkey") as factory,
+        ):
+            controller = self._controller()
+            controller._sync_hotkey(self._config(spec="typo+cmd+s"))
+        factory.assert_not_called()
+        self.assertIsNone(controller.hotkey)
+
+    def test_sync_skips_when_carbon_unavailable(self) -> None:
+        with (
+            patch("agent_voice.menubar.carbon_available", return_value=False),
+            patch("agent_voice.menubar.GlobalHotkey") as factory,
+        ):
+            controller = self._controller()
+            controller._sync_hotkey(self._config())
+        factory.assert_not_called()
+        self.assertIsNone(controller.hotkey)
+
+    def test_sync_handles_registration_failure(self) -> None:
+        failing = MagicMock()
+        failing.register.side_effect = OSError("combo in use")
+        with (
+            patch("agent_voice.menubar.carbon_available", return_value=True),
+            patch("agent_voice.menubar.GlobalHotkey", return_value=failing),
+        ):
+            controller = self._controller()
+            controller._sync_hotkey(self._config())  # must not raise
+        self.assertIsNone(controller.hotkey)
+        self.assertEqual(controller.hotkey_display, "")
+
+    def test_sync_retries_after_registration_failure(self) -> None:
+        failing = MagicMock()
+        failing.register.side_effect = OSError("combo in use")
+        succeeding = _RecordingHotkey()
+        with (
+            patch("agent_voice.menubar.carbon_available", return_value=True),
+            patch("agent_voice.menubar.GlobalHotkey", side_effect=[failing, succeeding]) as factory,
+        ):
+            controller = self._controller()
+            controller._sync_hotkey(self._config())
+            controller._sync_hotkey(self._config())
+        self.assertEqual(factory.call_count, 2)
+        self.assertIs(controller.hotkey, succeeding)
+        self.assertEqual(succeeding.registered_with.canonical, "alt+cmd+s")
+
+    def test_run_stop_speaking_invokes_runtime(self) -> None:
+        controller = self._controller()
+        controller._config = lambda: SimpleNamespace()  # bypass real config load
+        with patch("agent_voice.menubar.stop_speaking", return_value=4321) as stop:
+            controller._run_stop_speaking()
+        stop.assert_called_once()
+
+    def test_select_stop_hotkey_persists_and_resyncs(self) -> None:
+        created: list[_RecordingHotkey] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            controller = self._controller(config_path=config_path)
+            controller.refresh = lambda: None  # avoid full menu rebuild
+            sender = SimpleNamespace(representedObject=lambda: "ctrl+alt+cmd+.")
+            with (
+                patch("agent_voice.menubar.carbon_available", return_value=True),
+                patch("agent_voice.menubar.GlobalHotkey", side_effect=lambda: created.append(_RecordingHotkey()) or created[-1]),
+            ):
+                controller.selectStopHotkey_(sender)
+            config = load_config(config_path)
+            self.assertTrue(config.hotkey_enabled)
+            self.assertEqual(config.hotkey_stop_speaking, "ctrl+alt+cmd+.")
+            self.assertEqual(created[-1].registered_with.canonical, "ctrl+alt+cmd+.")
+
+    def test_select_stop_hotkey_off_disables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            controller = self._controller(config_path=config_path)
+            controller.refresh = lambda: None
+            sender = SimpleNamespace(representedObject=lambda: "off")
+            with (
+                patch("agent_voice.menubar.carbon_available", return_value=True),
+                patch("agent_voice.menubar.GlobalHotkey"),
+            ):
+                controller.selectStopHotkey_(sender)
+            self.assertFalse(load_config(config_path).hotkey_enabled)
+
+    def test_change_language_persists_and_restarts_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            controller = self._controller(config_path=config_path)
+            controller.refresh = lambda: None
+            controller._prompt_language = lambda current: "Spanish"
+            controller._restart_daemon_if_running = MagicMock()
+
+            controller.changeLanguage_(None)
+
+            self.assertEqual(load_config(config_path).language, "Spanish")
+            controller._restart_daemon_if_running.assert_called_once()
+
+    def test_prompt_language_returns_entered_value(self) -> None:
+        class FakeTextField:
+            def __init__(self) -> None:
+                self.value = ""
+
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def initWithFrame_(self, _frame):
+                return self
+
+            def setStringValue_(self, value) -> None:
+                self.value = str(value)
+
+            def stringValue(self):
+                return "Spanish"
+
+        class FakeAlert:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+            def setMessageText_(self, _value) -> None:
+                pass
+
+            def setInformativeText_(self, _value) -> None:
+                pass
+
+            def addButtonWithTitle_(self, _value) -> None:
+                pass
+
+            def setAccessoryView_(self, view) -> None:
+                self.view = view
+
+            def runModal(self) -> int:
+                return menubar_module.NS_ALERT_FIRST_BUTTON_RETURN
+
+        controller = self._controller()
+        with (
+            patch("agent_voice.menubar.NSAlert", FakeAlert),
+            patch("agent_voice.menubar.NSTextField", FakeTextField),
+        ):
+            self.assertEqual(controller._prompt_language("en"), "Spanish")
 
 
 if __name__ == "__main__":

@@ -9,17 +9,22 @@ import subprocess
 import sys
 from collections.abc import Callable
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
 from typing import TypeVar
+from urllib.parse import unquote, urlparse
 
 from .config import (
     AgentVoiceConfig,
+    language_display_name,
     load_config,
     normalize_language,
     set_config_language,
+    set_hotkey_config,
     set_voice_config,
     write_default_config,
 )
+from .hotkey import DEFAULT_STOP_SPEAKING_HOTKEY, HOTKEY_PRESETS, format_hotkey_display
 from .daemon import process_once, run_daemon
 from .db import connect, init_db
 from .delivery import DeliveryRouter, test_message
@@ -40,8 +45,15 @@ from .runtime import (
     voice_mute_status,
     voice_session_active,
 )
-from .secrets import delete_openai_keychain_secret, get_openai_secret_status, set_openai_keychain_secret
-from .ui import Choice, checkbox_select, confirm
+from .secrets import (
+    OpenAIKeyValidation,
+    delete_openai_keychain_secret,
+    get_openai_secret_status,
+    resolve_openai_api_key,
+    set_openai_keychain_secret,
+    validate_openai_tts_key,
+)
+from .ui import Choice, checkbox_select, select_one
 from .service import (
     daemon_status,
     menubar_service_paths,
@@ -63,6 +75,35 @@ SETUP_TARGETS: list[Choice] = [
 ]
 _SETUP_TARGET_LABEL = {choice.value: choice.label for choice in SETUP_TARGETS}
 _SETUP_TARGET_ORDER = [choice.value for choice in SETUP_TARGETS]
+
+# Voice backends offered by the `voiccce setup` voice picker.
+VOICE_BACKENDS: list[Choice] = [
+    Choice(
+        "openai_tts",
+        "OpenAI TTS",
+        "Natural cloud voice (recommended). Needs an OpenAI API key.",
+    ),
+    Choice(
+        "macos_say",
+        "macOS built-in voice",
+        "Offline and free. Uses the system 'say' voice, no API key.",
+    ),
+]
+# Default voice name per backend when the user does not pass --voice.
+_DEFAULT_VOICE = {"openai_tts": "marin", "macos_say": "Alex"}
+# Yes/No options for radio prompts where `esc` must cancel (unlike confirm(),
+# which maps cancel to its default).
+_YES_NO: list[Choice] = [Choice("yes", "Yes"), Choice("no", "No")]
+
+# Words that mean "turn the stop-speaking hotkey off" when passed to --hotkey.
+_HOTKEY_OFF_TOKENS = {"off", "none", "no", "disable", "disabled", "false", "0", ""}
+# Short hints shown beside each preset in the setup picker.
+_HOTKEY_PRESET_HINTS = {
+    "alt+cmd+s": "easy two-key combo",
+    "ctrl+alt+cmd+s": "three modifiers, no conflicts",
+    "ctrl+alt+cmd+.": "“.” reads as stop",
+    "alt+cmd+.": "easy two-key combo",
+}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -103,8 +144,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which agent(s) to wire hooks for. Omit for an interactive "
         "checkbox picker. 'both' is a legacy alias for claude-code + codex.",
     )
+    setup.add_argument("--language", help="Notification language, e.g. English, Russian, Spanish, or Japanese")
     setup.add_argument("--voice", default=None, help="Voice name (default: marin for OpenAI TTS, Alex for --local)")
-    setup.add_argument("--local", action="store_true", help="Use the local macOS say voice instead of OpenAI TTS (no API key)")
+    voice_backend_group = setup.add_mutually_exclusive_group()
+    voice_backend_group.add_argument(
+        "--local",
+        action="store_true",
+        help="Use the local macOS say voice instead of OpenAI TTS (no API key); skips the voice picker",
+    )
+    voice_backend_group.add_argument(
+        "--openai",
+        action="store_true",
+        help="Use OpenAI TTS (the premium cloud voice); skips the voice picker",
+    )
+    setup.add_argument(
+        "--hotkey",
+        help="Global stop-speaking hotkey, e.g. 'alt+cmd+s' or 'ctrl+alt+cmd+.'; "
+        "use 'off' to disable. Omit for an interactive picker.",
+    )
     setup.add_argument("--reset-key", action="store_true", help="Prompt for a new OpenAI key even if one is already configured")
     setup.add_argument("--no-test", action="store_true", help="Skip the test notification at the end")
     setup.add_argument(
@@ -136,6 +193,18 @@ def build_parser() -> argparse.ArgumentParser:
     stop = subparsers.add_parser("stop", help="Stop background daemon")
     stop.set_defaults(handler=cmd_stop)
 
+    update = subparsers.add_parser("update", help="Update this installation from a local checkout")
+    update.add_argument(
+        "--source",
+        help="Path to the voiccce checkout. Defaults to the current directory or the original install source.",
+    )
+    update.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="Do not restart daemon/menu bar after updating.",
+    )
+    update.set_defaults(handler=cmd_update)
+
     menubar = subparsers.add_parser("menubar", help="Run menu bar companion in the foreground")
     menubar.set_defaults(handler=cmd_menubar)
 
@@ -162,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(handler=cmd_status)
 
     config_cmd = subparsers.add_parser("config", help="Show or update local configuration")
-    config_cmd.add_argument("--language", choices=["en", "ru"], help="Notification language")
+    config_cmd.add_argument("--language", help="Notification language, e.g. English, Russian, Spanish, or Japanese")
     config_cmd.add_argument("--voice-backend", choices=["macos_say", "openai_tts"], help="Voice backend")
     config_cmd.add_argument("--voice", help="Voice name, e.g. Alex, marin, cedar")
     config_cmd.add_argument("--voice-rate", type=int, help="macOS say voice rate")
@@ -175,6 +244,10 @@ def build_parser() -> argparse.ArgumentParser:
     config_cmd.add_argument("--voice-audio-tokens-per-second", type=float, help="Estimated generated audio tokens per second")
     config_cmd.add_argument("--voice-instructions", help="Cloud TTS speaking style instructions")
     config_cmd.add_argument("--voice-api-key-env", help="Environment variable that contains the API key")
+    config_cmd.add_argument(
+        "--hotkey",
+        help="Global stop-speaking hotkey, e.g. 'alt+cmd+s' or 'ctrl+alt+cmd+.'; use 'off' to disable",
+    )
     config_cmd.set_defaults(handler=cmd_config)
 
     secret = subparsers.add_parser("secret", help="Manage local secrets in macOS Keychain")
@@ -310,23 +383,40 @@ def cmd_setup(args: argparse.Namespace) -> None:
     config_path = write_default_config(args.config)
     config = load_config(config_path)
 
+    # ── gather every interactive decision up front, then execute ──────────────
     targets = _resolve_setup_targets(args.target)
     if not targets:
         return
+    language_choice = _resolve_setup_language(args, default=config.language)
+    backend = _resolve_voice_backend(args)
+    menubar_choice = _resolve_menubar_choice(args)
+    hotkey_choice = _resolve_stop_hotkey(args, menubar_enabled=bool(menubar_choice))
+
     labels = ", ".join(
         _SETUP_TARGET_LABEL[t] for t in _SETUP_TARGET_ORDER if t in targets
     )
     print(f"→ Wiring hooks for: {labels}")
 
-    if args.local:
-        voice = args.voice or "Alex"
+    if backend == "openai_tts":
+        _ensure_openai_key(
+            config,
+            reset=args.reset_key,
+            voice=args.voice or _DEFAULT_VOICE["openai_tts"],
+        )
+
+    if language_choice is not None:
+        config_path = _apply_setup_language(config_path, language_choice)
+
+    if backend == "macos_say":
+        voice = args.voice or _DEFAULT_VOICE["macos_say"]
         set_voice_config(config_path, backend="macos_say", voice=voice)
         print(f"✓ Voice backend: macos_say (voice: {voice}, local macOS voice, no API key)")
     else:
-        voice = args.voice or "marin"
-        _ensure_openai_key(config, reset=args.reset_key)
+        voice = args.voice or _DEFAULT_VOICE["openai_tts"]
         set_voice_config(config_path, backend="openai_tts", voice=voice)
         print(f"✓ Voice backend: openai_tts (voice: {voice})")
+
+    _apply_stop_hotkey(config_path, hotkey_choice)
 
     installed: list[str] = []
     if "claude-code" in targets:
@@ -364,6 +454,10 @@ def cmd_setup(args: argparse.Namespace) -> None:
     pid = start_daemon(config)
     print(f"✓ Daemon started (pid {pid})")
 
+    # Finish any install work (incl. the menu bar dependency) before the test, so
+    # the audible test notification is the last thing the wizard does.
+    _maybe_setup_menubar(config, choice=menubar_choice)
+
     if not args.no_test:
         results = DeliveryRouter(config).deliver("Voiccce is ready.")
         if any(result.spoken for result in results):
@@ -372,8 +466,6 @@ def cmd_setup(args: argparse.Namespace) -> None:
             error = next((result.error for result in results if result.error), None)
             detail = f" ({error})" if error else ""
             print(f"! Test could not play audio{detail}. Check `voiccce status` and your OpenAI key.")
-
-    _maybe_setup_menubar(config, choice=args.menubar)
 
     print(f"\nDone. Edit {config.config_path} to customize voice, messages, and summaries.")
     if "claude-code" in installed:
@@ -401,14 +493,24 @@ def _setup_install(label: str, install: Callable[..., _InstallResult], **kwargs:
         raise SystemExit(f"Could not update your {label}: {exc}.")
 
 
-def _ensure_openai_key(config: AgentVoiceConfig, *, reset: bool) -> None:
-    status = get_openai_secret_status(config)
-    if status.available and not reset:
-        print(f"✓ Using existing OpenAI key (from {status.source})")
-        return
+def _ensure_openai_key(config: AgentVoiceConfig, *, reset: bool, voice: str | None = None) -> None:
+    key, status = resolve_openai_api_key(config)
+    if key and status.available and not reset:
+        validation = _validate_openai_key(config, key, voice=voice)
+        if validation.ok:
+            print(f"✓ Using existing OpenAI key (from {status.source})")
+            return
+        message = f"Existing OpenAI key from {status.source} failed validation: {validation.error}"
+        if not _interactive():
+            raise SystemExit(f"{message}. Re-run with `--reset-key` or update the key.")
+        print(f"! {message}")
+
     key = getpass.getpass("OpenAI API key: ").strip()
     if not key:
         raise SystemExit("No key entered. Re-run `voiccce setup`, or use `--local` for the macOS voice.")
+    validation = _validate_openai_key(config, key, voice=voice)
+    if not validation.ok:
+        raise SystemExit(f"OpenAI key validation failed: {validation.error}")
     try:
         set_openai_keychain_secret(config, key)
     except RuntimeError as exc:
@@ -419,6 +521,37 @@ def _ensure_openai_key(config: AgentVoiceConfig, *, reset: bool) -> None:
     print("✓ OpenAI key saved to macOS Keychain")
 
 
+def _validate_openai_key(
+    config: AgentVoiceConfig,
+    key: str,
+    *,
+    voice: str | None = None,
+) -> OpenAIKeyValidation:
+    print("  Checking OpenAI key with a short TTS generation...")
+    validation = validate_openai_tts_key(
+        config,
+        key,
+        voice=voice or _openai_validation_voice(config),
+    )
+    if validation.ok:
+        print("✓ OpenAI key can generate TTS audio")
+    return validation
+
+
+def _openai_validation_voice(config: AgentVoiceConfig) -> str:
+    if config.voice_backend == "openai_tts" and config.voice_name:
+        return config.voice_name
+    return _DEFAULT_VOICE["openai_tts"]
+
+
+def _interactive() -> bool:
+    """True when both stdin and stdout are real TTYs, so prompts can be shown."""
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
 def _resolve_setup_targets(target: str | None) -> set[str]:
     """Resolve which integrations to wire. Runs the interactive picker when omitted."""
     if target:
@@ -426,12 +559,7 @@ def _resolve_setup_targets(target: str | None) -> set[str]:
             return {"claude-code", "codex"}
         return {target}
 
-    interactive = False
-    try:
-        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
-    except Exception:
-        interactive = False
-    if not interactive:
+    if not _interactive():
         return {"claude-code", "codex"}
 
     selected = checkbox_select(
@@ -445,6 +573,115 @@ def _resolve_setup_targets(target: str | None) -> set[str]:
     if not selected:
         raise SystemExit(0)
     return set(selected)
+
+
+def _resolve_voice_backend(args: argparse.Namespace) -> str:
+    """Resolve the voice backend. Runs the interactive picker when no flag is given."""
+    if args.local:
+        return "macos_say"
+    if getattr(args, "openai", False):
+        return "openai_tts"
+    if not _interactive():
+        return "openai_tts"  # historical default for non-interactive setup
+
+    choice = select_one(
+        VOICE_BACKENDS,
+        title="Voiccce setup",
+        subtitle="Choose the voice",
+        default="openai_tts",
+    )
+    if choice is None:
+        raise SystemExit(0)
+    return choice
+
+
+def _resolve_setup_language(args: argparse.Namespace, *, default: str) -> str | None:
+    """Resolve the target notification language for setup.
+
+    Non-interactive setup preserves the existing config unless ``--language`` is
+    passed. Interactive setup lets the user type any language name.
+    """
+    if getattr(args, "language", None):
+        return args.language
+    if not _interactive():
+        return None
+
+    default_display = language_display_name(default)
+    try:
+        entered = input(f"Notification language [{default_display}]: ").strip()
+    except EOFError:
+        return None
+    return entered or default
+
+
+def _apply_setup_language(config_path: Path, language: str) -> Path:
+    try:
+        updated = set_config_language(config_path, language)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    print(f"✓ Notification language: {language_display_name(load_config(updated).language)}")
+    return updated
+
+
+def _resolve_menubar_choice(args: argparse.Namespace) -> bool | None:
+    """Resolve whether to install the menu bar app. Prompts up front when possible.
+
+    Returns ``True``/``False`` for an explicit decision, or ``None`` to defer to
+    ``_maybe_setup_menubar`` (non-macOS or non-interactive, which both skip it).
+    """
+    if args.menubar is not None:
+        return args.menubar
+    if sys.platform != "darwin" or not _interactive():
+        return None
+    # select_one (not confirm) so `esc` aborts the wizard like the other menus,
+    # rather than silently falling through to the "yes, install" default.
+    choice = select_one(_YES_NO, title="Install the macOS menu bar app?", default="yes")
+    if choice is None:
+        raise SystemExit(0)
+    return choice == "yes"
+
+
+def _resolve_stop_hotkey(args: argparse.Namespace, *, menubar_enabled: bool) -> str | None:
+    """Resolve the stop-speaking hotkey for setup.
+
+    Returns a spec, ``"off"``, or ``None`` (leave the config default in place).
+    Prompts only when a menu bar is being installed on an interactive Mac — the
+    hotkey only works while that app runs.
+    """
+    if getattr(args, "hotkey", None) is not None:
+        return args.hotkey
+    if not menubar_enabled or sys.platform != "darwin" or not _interactive():
+        return None
+
+    choices = [
+        Choice(spec, format_hotkey_display(spec), _HOTKEY_PRESET_HINTS.get(spec, ""))
+        for spec in HOTKEY_PRESETS
+    ]
+    choices.append(Choice("off", "Off", "No global stop-speaking hotkey"))
+    choice = select_one(
+        choices,
+        title="Stop-speaking hotkey",
+        subtitle="Press it in any app to silence the current announcement",
+        default=DEFAULT_STOP_SPEAKING_HOTKEY,
+    )
+    if choice is None:
+        raise SystemExit(0)
+    return choice
+
+
+def _apply_stop_hotkey(config_path: Path, choice: str | None) -> None:
+    """Persist a setup hotkey choice (spec / 'off' / None=no change) and report it."""
+    if choice is None:
+        return
+    if choice.strip().lower() in _HOTKEY_OFF_TOKENS:
+        set_hotkey_config(config_path, enabled=False)
+        print("✓ Stop-speaking hotkey: off")
+        return
+    try:
+        set_hotkey_config(config_path, enabled=True, stop_speaking=choice)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid hotkey '{choice}': {exc}")
+    print(f"✓ Stop-speaking hotkey: {format_hotkey_display(choice)} (works while the menu bar app runs)")
 
 
 def _cocoa_available() -> bool:
@@ -477,16 +714,13 @@ def _ensure_menubar_dependency() -> bool:
 
 
 def _maybe_setup_menubar(config: AgentVoiceConfig, *, choice: bool | None) -> None:
+    # `choice` is resolved up front by _resolve_menubar_choice: True/False from a
+    # flag or prompt, or None to skip (non-macOS or non-interactive).
     if sys.platform != "darwin":
         if choice:
             print("! Menu bar app is macOS-only; skipping.")
         return
-    enable = choice
-    if enable is None:
-        if not sys.stdin.isatty():
-            return
-        enable = confirm("Enable the macOS menu bar app?", default=True)
-    if not enable:
+    if not choice:
         return
     if not _ensure_menubar_dependency():
         print(
@@ -524,8 +758,10 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"Queue pending: {pending}")
     print(f"Queue processed: {processed}")
     print(f"Queue failed: {failed}")
-    print(f"Language: {config.language}")
+    print(f"Language: {language_display_name(config.language)}")
     print(f"Voice: {config.voice_backend} / {config.voice_name or '-'}")
+    hotkey_line = format_hotkey_display(config.hotkey_stop_speaking) if config.hotkey_enabled else "off"
+    print(f"Stop-speaking hotkey: {hotkey_line} (menu bar)")
     mute_status = voice_mute_status(config)
     if mute_status.muted and mute_status.muted_until:
         muted_until = datetime.fromtimestamp(mute_status.muted_until).strftime("%Y-%m-%d %H:%M:%S")
@@ -583,6 +819,124 @@ def cmd_stop(args: argparse.Namespace) -> None:
         print(f"Daemon stopped: pid {pid}")
     else:
         print("Daemon was not running")
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    source = _resolve_update_source(args.source)
+    config = load_config(args.config)
+    daemon_pid, daemon_running = daemon_status(config)
+    menubar_pid, menubar_running = menubar_status(config)
+    command = _update_install_command(source)
+
+    print(f"Updating Voiccce from: {source}")
+    completed = subprocess.run(command, cwd=str(source))
+    if completed.returncode != 0:
+        raise SystemExit(f"Update failed with exit code {completed.returncode}.")
+    print("✓ Package updated")
+
+    if args.no_restart:
+        if daemon_running or menubar_running:
+            print("Skipped restart; running processes still use the old code until restarted.")
+        return
+
+    if daemon_running:
+        stopped = stop_daemon(config)
+        restarted = start_daemon(config)
+        print(f"✓ Daemon restarted ({stopped or daemon_pid} → {restarted})")
+    if menubar_running:
+        stopped = stop_menubar(config)
+        restarted = start_menubar(config)
+        print(f"✓ Menu bar restarted ({stopped or menubar_pid} → {restarted})")
+    if not daemon_running and not menubar_running:
+        print("No running daemon/menu bar to restart.")
+
+
+def _resolve_update_source(source: str | None) -> Path:
+    if source:
+        return _validate_update_source(Path(source).expanduser())
+
+    cwd = Path.cwd()
+    if _is_update_source(cwd):
+        return cwd.resolve()
+
+    installed_source = _installed_source_path()
+    if installed_source is not None and _is_update_source(installed_source):
+        return installed_source.resolve()
+
+    raise SystemExit(
+        "Could not find a local voiccce checkout. Run `voiccce update` from the repo "
+        "or pass `--source /path/to/voiccce`."
+    )
+
+
+def _validate_update_source(source: Path) -> Path:
+    resolved = source.resolve()
+    if not _is_update_source(resolved):
+        raise SystemExit(
+            f"{resolved} does not look like a voiccce checkout "
+            "(expected pyproject.toml and agent_voice/)."
+        )
+    return resolved
+
+
+def _is_update_source(path: Path) -> bool:
+    return (path / "pyproject.toml").is_file() and (path / "agent_voice").is_dir()
+
+
+def _installed_source_path() -> Path | None:
+    try:
+        direct_url = metadata.distribution("voiccce").read_text("direct_url.json")
+    except metadata.PackageNotFoundError:
+        return None
+    if not direct_url:
+        return None
+    try:
+        data = json.loads(direct_url)
+    except json.JSONDecodeError:
+        return None
+    url = str(data.get("url", ""))
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    return Path(unquote(parsed.path)).expanduser()
+
+
+def _update_install_command(source: Path) -> list[str]:
+    pip_args = [
+        "install",
+        "--force-reinstall",
+        "--no-deps",
+        "-e",
+        str(source),
+    ]
+    pipx_package = _pipx_package_name()
+    if pipx_package and shutil.which("pipx"):
+        return ["pipx", "runpip", pipx_package, *pip_args]
+    return [sys.executable, "-m", "pip", *pip_args]
+
+
+def _pipx_package_name() -> str | None:
+    prefix = Path(sys.prefix)
+    package = _pipx_package_name_from_venv(prefix)
+    if package:
+        return package
+    script = shutil.which("voiccce")
+    if not script:
+        return None
+    return _pipx_package_name_from_script(Path(script))
+
+
+def _pipx_package_name_from_venv(path: Path) -> str | None:
+    if path.parent.name == "venvs" and path.parent.parent.name == "pipx":
+        return path.name
+    return None
+
+
+def _pipx_package_name_from_script(path: Path) -> str | None:
+    resolved = path.resolve()
+    if resolved.parent.name != "bin":
+        return None
+    return _pipx_package_name_from_venv(resolved.parent.parent)
 
 
 def cmd_menubar(args: argparse.Namespace) -> None:
@@ -645,7 +999,10 @@ def cmd_test(args: argparse.Namespace) -> None:
 def cmd_config(args: argparse.Namespace) -> None:
     changed = False
     if args.language:
-        config_path = set_config_language(args.config, args.language)
+        try:
+            config_path = set_config_language(args.config, args.language)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
         changed = True
     else:
         config_path = write_default_config(args.config)
@@ -668,10 +1025,20 @@ def cmd_config(args: argparse.Namespace) -> None:
         config_path = set_voice_config(config_path, **voice_options)
         changed = True
 
+    if args.hotkey is not None:
+        if args.hotkey.strip().lower() in _HOTKEY_OFF_TOKENS:
+            config_path = set_hotkey_config(config_path, enabled=False)
+        else:
+            try:
+                config_path = set_hotkey_config(config_path, enabled=True, stop_speaking=args.hotkey)
+            except ValueError as exc:
+                raise SystemExit(f"Invalid hotkey '{args.hotkey}': {exc}")
+        changed = True
+
     config = load_config(args.config)
     normalize_language(config.language)
     print(f"Config: {config.config_path}")
-    print(f"Language: {config.language}")
+    print(f"Language: {language_display_name(config.language)}")
     print(f"Database: {config.database_path}")
     print(f"Voice backend: {config.voice_backend}")
     print(f"Voice: {config.voice_name or '-'}")
@@ -683,6 +1050,8 @@ def cmd_config(args: argparse.Namespace) -> None:
     print(f"Voice audio output price per 1M tokens: {format_usd(config.voice_audio_output_price_per_million_tokens_usd)}")
     print(f"Voice audio tokens per second estimate: {config.voice_audio_tokens_per_second:g}")
     print(f"Voice API key env: {config.voice_api_key_env}")
+    hotkey_line = format_hotkey_display(config.hotkey_stop_speaking) if config.hotkey_enabled else "off"
+    print(f"Stop-speaking hotkey: {hotkey_line}")
     print(f"Summary: {'enabled' if config.summary_enabled else 'disabled'}")
     print(f"Summary provider: {config.summary_provider}")
     print(f"Summary model: {config.summary_model}")
@@ -789,6 +1158,9 @@ def cmd_secret_set(args: argparse.Namespace) -> None:
         secret = getpass.getpass("OpenAI API key: ").strip()
         if not secret:
             raise SystemExit("No key entered")
+        validation = _validate_openai_key(config, secret)
+        if not validation.ok:
+            raise SystemExit(f"OpenAI key validation failed: {validation.error}")
         set_openai_keychain_secret(config, secret)
         print("OpenAI API key stored in macOS Keychain.")
         print("Restart daemon to apply changes.")

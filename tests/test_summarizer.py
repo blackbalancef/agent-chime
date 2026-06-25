@@ -124,6 +124,27 @@ class SummarizerTests(unittest.TestCase):
 
         self.assertIn("Write the notification in Russian", result.prompt)
 
+    def test_prompt_accepts_custom_language_name(self) -> None:
+        config = AgentVoiceConfig(language="Spanish", summary_enabled=True)
+        candidate = SimpleNamespace(
+            agent_name="codex",
+            project_name="api",
+            status=SessionStatus.COMPLETED,
+            message="All tests pass.",
+            summary_source_text="All tests pass.",
+        )
+
+        with (
+            patch(
+                "agent_voice.intelligence.summarizer.resolve_openai_api_key",
+                return_value=("sk-test", SecretStatus(source="env", available=True)),
+            ),
+            patch("agent_voice.intelligence.summarizer.urllib.request.urlopen", lambda request, timeout: FakeResponse()),
+        ):
+            result = summarize_notification(config, candidate)
+
+        self.assertIn("Write the notification in Spanish", result.prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

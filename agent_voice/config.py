@@ -5,6 +5,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .hotkey import DEFAULT_STOP_SPEAKING_HOTKEY, parse_hotkey
 from .tts_cost import (
     DEFAULT_TTS_AUDIO_OUTPUT_PRICE_PER_MILLION_TOKENS_USD,
     DEFAULT_TTS_AUDIO_TOKENS_PER_SECOND,
@@ -17,6 +18,8 @@ from .tts_cost import (
 DEFAULT_HOME = Path.home() / ".voiccce"
 DEFAULT_CONFIG_PATH = DEFAULT_HOME / "config.toml"
 DEFAULT_DB_PATH = DEFAULT_HOME / "events.sqlite3"
+# Languages with bundled template-only messages. AI summary output can target
+# any non-empty language name through [user].language.
 SUPPORTED_LANGUAGES = ("en", "ru")
 # Human-readable language names injected into the summary prompt so the model is
 # instructed to write in the configured language ("Russian") rather than a code.
@@ -76,6 +79,10 @@ DEFAULT_SUMMARY_CONFIG: dict[str, str | int | float | bool] = {
     "cached_input_price_per_million_tokens_usd": DEFAULT_SUMMARY_CACHED_INPUT_PRICE_PER_MILLION_TOKENS_USD,
     "text_output_price_per_million_tokens_usd": DEFAULT_SUMMARY_TEXT_OUTPUT_PRICE_PER_MILLION_TOKENS_USD,
     "prompt": DEFAULT_SUMMARY_PROMPT,
+}
+DEFAULT_HOTKEY_CONFIG: dict[str, str | bool] = {
+    "enabled": True,
+    "stop_speaking": DEFAULT_STOP_SPEAKING_HOTKEY,
 }
 
 
@@ -170,6 +177,13 @@ instructions = "Speak naturally, calmly, and briefly. This is a short developer 
 timeout_seconds = 15
 interrupt_on_user_input = true
 
+[hotkey]
+# Global keyboard shortcut (works in any app while the menu bar app runs) that
+# instantly stops the current voice playback — handy during meetings. Modifiers:
+# cmd, ctrl, alt/option, shift. Set enabled = false to turn it off.
+enabled = true
+stop_speaking = "alt+cmd+s"
+
 [desktop]
 enabled = true
 
@@ -263,6 +277,8 @@ class AgentVoiceConfig:
     voice_instructions: str = "Speak naturally, calmly, and briefly. This is a short developer notification."
     voice_timeout_seconds: int = 15
     voice_interrupt_on_user_input: bool = True
+    hotkey_enabled: bool = True
+    hotkey_stop_speaking: str = DEFAULT_STOP_SPEAKING_HOTKEY
     summary_enabled: bool = True
     summary_provider: str = "openai"
     summary_model: str = DEFAULT_SUMMARY_MODEL
@@ -309,6 +325,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgentVoiceConfig:
     terminal = data.get("terminal", {})
     limits = data.get("limits", {})
     events = data.get("events", {})
+    hotkey = data.get("hotkey", {})
 
     voice_estimated_cost_per_minute_usd = float(
         voice.get("estimated_cost_per_minute_usd", DEFAULT_TTS_ESTIMATED_COST_PER_MINUTE_USD)
@@ -359,6 +376,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgentVoiceConfig:
         ),
         voice_timeout_seconds=int(voice.get("timeout_seconds", 15)),
         voice_interrupt_on_user_input=bool(voice.get("interrupt_on_user_input", True)),
+        hotkey_enabled=bool(hotkey.get("enabled", True)),
+        hotkey_stop_speaking=str(hotkey.get("stop_speaking", DEFAULT_STOP_SPEAKING_HOTKEY)),
         summary_enabled=bool(summary.get("enabled", True)),
         summary_provider=normalize_summary_provider(summary.get("provider", "openai")),
         summary_model=summary.get("model", DEFAULT_SUMMARY_MODEL),
@@ -412,6 +431,7 @@ def write_default_config(path: str | os.PathLike[str] | None = None) -> Path:
         config_path.chmod(0o600)
     else:
         ensure_default_summary_section(config_path)
+        ensure_default_hotkey_section(config_path)
         ensure_default_message_sections(config_path)
     return config_path
 
@@ -423,7 +443,10 @@ def default_database_path_for_config(config_path: Path) -> Path:
 
 
 def normalize_language(language: str) -> str:
-    value = language.strip().lower()
+    original = str(language).strip()
+    if not original:
+        raise ValueError("Language cannot be empty")
+    value = original.lower()
     aliases = {
         "english": "en",
         "en-us": "en",
@@ -432,11 +455,12 @@ def normalize_language(language: str) -> str:
         "русский": "ru",
         "ru-ru": "ru",
     }
-    normalized = aliases.get(value, value)
-    if normalized not in SUPPORTED_LANGUAGES:
-        supported = ", ".join(SUPPORTED_LANGUAGES)
-        raise ValueError(f"Unsupported language '{language}'. Supported: {supported}")
-    return normalized
+    return aliases.get(value, original)
+
+
+def language_display_name(language: str) -> str:
+    normalized = normalize_language(language)
+    return LANGUAGE_NAMES.get(normalized, normalized)
 
 
 def copy_message_templates(templates: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
@@ -492,6 +516,22 @@ def ensure_default_summary_section(config_path: Path) -> None:
     if not missing:
         return
     ensure_config_section_values(config_path, "summary", missing)
+
+
+def ensure_default_hotkey_section(config_path: Path) -> None:
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError:
+        return
+
+    current = data.get("hotkey", {})
+    missing = dict(DEFAULT_HOTKEY_CONFIG)
+    if isinstance(current, dict):
+        for key in current:
+            missing.pop(key, None)
+    if not missing:
+        return
+    ensure_config_section_values(config_path, "hotkey", missing)
 
 
 def ensure_config_section_values(
@@ -556,7 +596,7 @@ def set_config_language(path: str | os.PathLike[str] | None, language: str) -> P
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
             if in_user_section and not wrote_language:
-                output.append(f'language = "{normalized}"')
+                output.append(_toml_assignment("language", normalized))
                 wrote_language = True
             in_user_section = stripped == "[user]"
             saw_user_section = saw_user_section or in_user_section
@@ -564,18 +604,18 @@ def set_config_language(path: str | os.PathLike[str] | None, language: str) -> P
             continue
 
         if in_user_section and stripped.startswith("language"):
-            output.append(f'language = "{normalized}"')
+            output.append(_toml_assignment("language", normalized))
             wrote_language = True
             continue
 
         output.append(line)
 
     if in_user_section and not wrote_language:
-        output.append(f'language = "{normalized}"')
+        output.append(_toml_assignment("language", normalized))
         wrote_language = True
 
     if not saw_user_section:
-        output = ["[user]", f'language = "{normalized}"', ""] + output
+        output = ["[user]", _toml_assignment("language", normalized), ""] + output
 
     config_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
     config_path.chmod(0o600)
@@ -648,6 +688,21 @@ def set_summary_config(
     if model is not None:
         values["model"] = model
     return set_config_section_values(path, "summary", values)
+
+
+def set_hotkey_config(
+    path: str | os.PathLike[str] | None,
+    *,
+    enabled: bool | None = None,
+    stop_speaking: str | None = None,
+) -> Path:
+    """Update the [hotkey] section. ``stop_speaking`` is validated and stored canonically."""
+    values: dict[str, str | int | float | bool] = {}
+    if enabled is not None:
+        values["enabled"] = bool(enabled)
+    if stop_speaking is not None:
+        values["stop_speaking"] = parse_hotkey(stop_speaking).canonical
+    return set_config_section_values(path, "hotkey", values)
 
 
 def set_events_config(

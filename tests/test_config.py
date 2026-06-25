@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agent_voice.config import (
     AgentVoiceConfig,
+    language_display_name,
     load_config,
     set_config_language,
     set_events_config,
@@ -36,6 +37,29 @@ class ConfigTests(unittest.TestCase):
 
             set_config_language(config_path, "русский")
             self.assertEqual(load_config(config_path).language, "ru")
+
+    def test_set_config_language_accepts_custom_language_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+
+            set_config_language(config_path, "Spanish")
+            self.assertEqual(load_config(config_path).language, "Spanish")
+            self.assertEqual(language_display_name(load_config(config_path).language), "Spanish")
+
+    def test_set_config_language_escapes_custom_language_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+
+            set_config_language(config_path, 'Portuguese "Brazil"')
+
+            self.assertEqual(load_config(config_path).language, 'Portuguese "Brazil"')
+
+    def test_set_config_language_rejects_empty_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+
+            with self.assertRaises(ValueError):
+                set_config_language(config_path, " ")
 
     def test_default_message_templates_include_russian(self) -> None:
         config = AgentVoiceConfig()

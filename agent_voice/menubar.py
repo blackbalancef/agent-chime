@@ -9,6 +9,7 @@ from pathlib import Path
 try:
     import objc
     from AppKit import (
+        NSAlert,
         NSApplication,
         NSApplicationActivationPolicyAccessory,
         NSButton,
@@ -27,6 +28,7 @@ try:
     from PyObjCTools import AppHelper
 except Exception as exc:  # pragma: no cover - platform dependent
     objc = None
+    NSAlert = None
     NSApplication = None
     NSApplicationActivationPolicyAccessory = None
     NSButton = None
@@ -57,12 +59,22 @@ from .config import (
     SUMMARY_MODEL_CHOICES,
     TTS_MODEL_CHOICES,
     VOICE_CHOICES,
+    language_display_name,
     load_config,
+    set_config_language,
     set_events_config,
+    set_hotkey_config,
     set_summary_config,
     set_voice_config,
 )
 from .delivery import DeliveryRouter, test_message
+from .hotkey import (
+    HOTKEY_PRESETS,
+    GlobalHotkey,
+    carbon_available,
+    format_hotkey_display,
+    parse_hotkey,
+)
 from .runtime import (
     clear_voice_mute,
     clear_voice_pid,
@@ -107,6 +119,7 @@ VOICE_SPEED_TAG_SCALE = 100
 # Raw NSEventType values; constant across AppKit and available without Cocoa.
 LEFT_MOUSE_DOWN_EVENT_TYPE = 1
 LEFT_MOUSE_DRAGGED_EVENT_TYPE = 6
+NS_ALERT_FIRST_BUTTON_RETURN = 1000
 
 
 def menu_voice_speed_value(speed: float) -> float:
@@ -187,6 +200,11 @@ class AgentVoiceMenuBar(NSObject):
         self.speed_slider = None
         self.last_shown_speed = None
         self.test_playing = False
+        # Global stop-speaking hotkey (Carbon). Synced from config on each refresh.
+        self.hotkey = None
+        self.hotkey_spec = None
+        self.hotkey_enabled_state = None
+        self.hotkey_display = ""
         self.status_images = {
             False: self._make_status_image(muted=False),
             True: self._make_status_image(muted=True),
@@ -221,6 +239,7 @@ class AgentVoiceMenuBar(NSObject):
     @_python_method
     def refresh(self) -> None:
         config = load_config(self.config_path)
+        self._sync_hotkey(config)
         mute_status = voice_mute_status(config)
         voice_pid, voice_active = self._voice_activity(config)
         self._update_status_button(
@@ -370,7 +389,11 @@ class AgentVoiceMenuBar(NSObject):
         self._add_dashboard_items(menu, config)
         menu.addItem_(NSMenuItem.separatorItem())
 
-        menu.addItem_(self._item("Stop Speaking", "stopSpeaking:"))
+        stop_title = "Stop Speaking"
+        if self.hotkey is not None and self.hotkey_display:
+            stop_title = f"Stop Speaking  ({self.hotkey_display})"
+        menu.addItem_(self._item(stop_title, "stopSpeaking:"))
+        menu.addItem_(self._hotkey_submenu_item(config))
         menu.addItem_(self._item("Mute 10 min", "muteTenMinutes:"))
         menu.addItem_(self._item("Mute 1 hour", "muteOneHour:"))
         menu.addItem_(self._item("Unmute", "unmute:"))
@@ -405,6 +428,13 @@ class AgentVoiceMenuBar(NSObject):
 
     @_python_method
     def _add_picker_items(self, menu: object, config) -> None:
+        menu.addItem_(
+            self._item(
+                f"Notification language: {language_display_name(config.language)}",
+                "changeLanguage:",
+            )
+        )
+
         voice_choices = self._choices_with_current(
             VOICE_CHOICES.get(config.voice_backend, ()), config.voice_name
         )
@@ -455,6 +485,56 @@ class AgentVoiceMenuBar(NSObject):
         interrupt_item.setTarget_(self)
         interrupt_item.setState_(1 if config.voice_interrupt_on_user_input else 0)
         menu.addItem_(interrupt_item)
+
+    @_python_method
+    def _hotkey_submenu_item(self, config) -> object:
+        """A submenu to pick (or disable) the global stop-speaking hotkey."""
+        enabled = config.hotkey_enabled
+        current = config.hotkey_stop_speaking
+        # Parse once: a hand-edited config can carry an invalid spec, which we want
+        # to surface clearly rather than show a checkmark-less ghost entry.
+        parsed_current = None
+        if enabled and current:
+            try:
+                parsed_current = parse_hotkey(current)
+            except ValueError:
+                parsed_current = None
+
+        if not enabled:
+            title = "Stop hotkey: off"
+        elif parsed_current is not None:
+            title = f"Stop hotkey: {parsed_current.display}"
+        else:
+            title = f"Stop hotkey: {current} (invalid — pick one)"
+
+        if not carbon_available():
+            return self._item(f"{title} — unavailable on this Mac", enabled=False)
+
+        parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+        submenu = NSMenu.alloc().init()
+
+        current_canonical = parsed_current.canonical if parsed_current is not None else None
+        specs = list(HOTKEY_PRESETS)
+        if current_canonical and current_canonical not in specs:
+            specs.insert(0, current_canonical)
+        for spec in specs:
+            child = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                format_hotkey_display(spec), "selectStopHotkey:", ""
+            )
+            child.setTarget_(self)
+            child.setRepresentedObject_(spec)
+            child.setState_(1 if spec == current_canonical else 0)
+            submenu.addItem_(child)
+
+        submenu.addItem_(NSMenuItem.separatorItem())
+        off = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Off", "selectStopHotkey:", "")
+        off.setTarget_(self)
+        off.setRepresentedObject_("off")
+        off.setState_(0 if enabled else 1)
+        submenu.addItem_(off)
+
+        parent.setSubmenu_(submenu)
+        return parent
 
     @_python_method
     def _choices_with_current(self, choices: tuple[str, ...], current: str | None) -> list[str]:
@@ -620,6 +700,86 @@ class AgentVoiceMenuBar(NSObject):
     def _config(self):
         return load_config(self.config_path)
 
+    @_python_method
+    def _sync_hotkey(self, config) -> None:
+        """Register/replace/remove the global hotkey to match the current config."""
+        enabled = config.hotkey_enabled
+        spec = config.hotkey_stop_speaking
+        if enabled == self.hotkey_enabled_state and spec == self.hotkey_spec:
+            return
+        self._teardown_hotkey()
+        if not enabled:
+            self.hotkey_enabled_state = enabled
+            self.hotkey_spec = spec
+            return
+        if not carbon_available():
+            self.hotkey_enabled_state = enabled
+            self.hotkey_spec = spec
+            self._log("Global hotkey unavailable (Carbon framework not found)")
+            return
+        try:
+            parsed = parse_hotkey(spec)
+        except ValueError as exc:
+            self.hotkey_enabled_state = enabled
+            self.hotkey_spec = spec
+            self._log(f"Invalid stop-speaking hotkey '{spec}': {exc}")
+            return
+        try:
+            hotkey = GlobalHotkey()
+            hotkey.register(parsed, self._on_stop_hotkey)
+        except Exception as exc:
+            # A registration failure can be transient (for example, another app
+            # temporarily owns the combo), so do not mark this config as synced.
+            self._log(f"Could not register stop-speaking hotkey {parsed.display}: {exc}")
+            return
+        self.hotkey = hotkey
+        self.hotkey_enabled_state = enabled
+        self.hotkey_spec = spec
+        self.hotkey_display = parsed.display
+        self._log(f"Stop-speaking hotkey registered: {parsed.display} ({parsed.canonical})")
+
+    @_python_method
+    def _teardown_hotkey(self) -> None:
+        if self.hotkey is not None:
+            try:
+                self.hotkey.unregister()
+            except Exception as exc:
+                self._log(f"Hotkey unregister failed: {exc}")
+        self.hotkey = None
+        self.hotkey_display = ""
+
+    @_python_method
+    def _on_stop_hotkey(self) -> None:
+        # Fired by Carbon on the main run loop. Stopping playback can briefly block
+        # (SIGTERM then SIGKILL), so hand it to a worker thread to keep the UI snappy.
+        self._log(f"Stop-speaking hotkey pressed ({self.hotkey_display})")
+        threading.Thread(target=self._run_stop_speaking, daemon=True).start()
+
+    @_python_method
+    def _run_stop_speaking(self) -> None:
+        try:
+            pid = stop_speaking(self._config())
+            self._log(f"Hotkey stop-speaking; pid={pid or '-'}")
+        except Exception as exc:
+            self._log(f"Hotkey stop-speaking failed: {exc}")
+
+    def selectStopHotkey_(self, sender) -> None:
+        spec = str(sender.representedObject())
+        config = self._config()
+        if spec == "off":
+            set_hotkey_config(config.config_path, enabled=False)
+            self._log("Stop-speaking hotkey disabled")
+        else:
+            try:
+                set_hotkey_config(config.config_path, enabled=True, stop_speaking=spec)
+            except ValueError as exc:
+                self._log(f"Invalid hotkey '{spec}': {exc}")
+                return
+            self._log(f"Stop-speaking hotkey set to {format_hotkey_display(spec)}")
+        # Apply immediately (no daemon restart — the hotkey lives in the menu bar).
+        self._sync_hotkey(self._config())
+        self.refresh()
+
     def stopSpeaking_(self, sender) -> None:
         pid = stop_speaking(self._config())
         self._log(f"Stop Speaking clicked; pid={pid or '-'}")
@@ -732,14 +892,12 @@ class AgentVoiceMenuBar(NSObject):
                 f"Playing test audio (voice {config.voice_name or '—'}, "
                 f"{format_voice_speed(config.voice_speed)})"
             )
-            results = DeliveryRouter(config).deliver(test_message(config))
-            if any(result.spoken for result in results):
-                self._log("Test audio played")
+            result = DeliveryRouter(config).deliver_configured_voice(test_message(config))
+            if result.spoken:
+                self._log(f"Test audio played via {result.channel}")
             else:
-                channel = results[-1].channel if results else "none"
-                error = next((result.error for result in results if result.error), None)
-                detail = f": {error}" if error else ""
-                self._log(f"Test audio not spoken (channel {channel}{detail})")
+                detail = f": {result.error}" if result.error else ""
+                self._log(f"Test audio not spoken (channel {result.channel}{detail})")
         except Exception as exc:
             self._log(f"Test audio failed: {exc}")
         finally:
@@ -752,6 +910,40 @@ class AgentVoiceMenuBar(NSObject):
         self._restart_daemon_if_running()
         self._log(f"Summary model set to {model}")
         self.refresh()
+
+    def changeLanguage_(self, sender) -> None:
+        config = self._config()
+        language = self._prompt_language(config.language)
+        if language is None:
+            return
+        try:
+            set_config_language(config.config_path, language)
+        except ValueError as exc:
+            self._log(f"Notification language not changed: {exc}")
+            return
+        self._restart_daemon_if_running()
+        self._log(f"Notification language set to {language_display_name(self._config().language)}")
+        self.refresh()
+
+    @_python_method
+    def _prompt_language(self, current: str) -> str | None:
+        if NSAlert is None or NSTextField is None:
+            return None
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Notification language")
+        alert.setInformativeText_("Type any language name, e.g. English, Russian, Spanish, or Japanese.")
+        alert.addButtonWithTitle_("Save")
+        alert.addButtonWithTitle_("Cancel")
+
+        field = NSTextField.alloc().initWithFrame_(((0.0, 0.0), (280.0, 24.0)))
+        field.setStringValue_(language_display_name(current))
+        alert.setAccessoryView_(field)
+
+        if alert.runModal() != NS_ALERT_FIRST_BUTTON_RETURN:
+            return None
+        value = str(field.stringValue()).strip()
+        return value or None
 
     def toggleIdleReminders_(self, sender) -> None:
         config = self._config()
@@ -791,6 +983,7 @@ class AgentVoiceMenuBar(NSObject):
 
     def quit_(self, sender) -> None:
         self._log("Quit Menu Bar clicked")
+        self._teardown_hotkey()
         NSApplication.sharedApplication().terminate_(self)
 
     @_python_method

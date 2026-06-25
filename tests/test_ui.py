@@ -54,7 +54,7 @@ class ColorDetectionTests(unittest.TestCase):
         import os
         from unittest.mock import patch
 
-        with patch.dict(os.environ, {"CLICOLOR_FORCE": "1"}):
+        with patch.dict(os.environ, {"CLICOLOR_FORCE": "1"}, clear=True):
             self.assertTrue(color_supported(StringIO()))
 
     def test_no_color_disables(self):
@@ -162,6 +162,27 @@ class FrameRenderingTests(unittest.TestCase):
         card = widget._title_card().split("\n")
         widths = {display_width(line) for line in card}
         self.assertEqual(len(widths), 1)  # all three box lines same width
+
+    def test_render_counts_physical_lines_including_title_card(self):
+        # Regression: the title card is one "\n"-joined entry in the frame. In a
+        # raw-mode terminal a bare "\n" is line-feed only, so the card's lines must
+        # each be emitted on their own carriage-return-anchored line and counted
+        # individually — otherwise the cursor-up redraw desyncs and frames stack
+        # ("staircase" of repeated title cards).
+        out = StringIO()
+        widget = MultiSelect(
+            CHOICES,
+            title="Voiccce setup",
+            subtitle="Choose what to wire hooks for",
+            stream=out,
+            get_key=keys([]),
+            interactive=True,
+        )
+        widget._render()
+        physical = sum(entry.count("\n") + 1 for entry in widget._build_frame())
+        self.assertGreater(physical, len(widget._build_frame()))  # card spans >1 line
+        self.assertEqual(widget._drawn, physical)
+        self.assertEqual(out.getvalue().count("\r\033[K"), physical)
 
 
 class SingleSelectTests(unittest.TestCase):

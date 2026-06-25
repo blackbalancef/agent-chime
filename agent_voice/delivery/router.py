@@ -87,6 +87,12 @@ class DeliveryRouter:
 
         return results
 
+    def deliver_configured_voice(self, message: str) -> DeliveryResult:
+        """Play through the configured voice backend without desktop/terminal fallback."""
+        if not self.config.voice_enabled:
+            return DeliveryResult(channel="voice_disabled", delivered=False, error="voice disabled")
+        return self._voice(message)
+
     def _voice(self, message: str) -> DeliveryResult:
         if is_voice_muted(self.config):
             return DeliveryResult(channel="voice_muted", delivered=False, error="voice muted")
@@ -157,7 +163,8 @@ class DeliveryRouter:
             return DeliveryResult(channel="openai_tts", delivered=False, error="afplay command not found")
 
         suffix = f".{self.config.voice_format}"
-        tmp_path = Path(tempfile.NamedTemporaryFile(delete=False, suffix=suffix).name)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_path = Path(tmp_file.name)
         payload = {
             "model": self.config.voice_model,
             "voice": self.config.voice_name or "marin",

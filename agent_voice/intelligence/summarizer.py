@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from agent_voice.config import AgentVoiceConfig, DEFAULT_SUMMARY_PROMPT, LANGUAGE_NAMES
+from agent_voice.config import AgentVoiceConfig, DEFAULT_SUMMARY_PROMPT, language_display_name
 from agent_voice.models import SessionStatus
 from agent_voice.secrets import resolve_openai_api_key
 
@@ -131,7 +131,7 @@ def _format_prompt(config: AgentVoiceConfig, candidate: object, source_text: str
         "project": getattr(candidate, "project_name", "") or "session",
         "status": getattr(getattr(candidate, "status", None), "value", getattr(candidate, "status", "")),
         "language": config.language,
-        "language_name": LANGUAGE_NAMES.get(config.language, config.language),
+        "language_name": language_display_name(config.language),
         "max_words": config.summary_max_words,
         "message": source_text,
     }

@@ -51,6 +51,28 @@ class DeliveryTests(unittest.TestCase):
             self.assertFalse(result.delivered)
             self.assertEqual(result.channel, "voice_muted")
 
+    def test_configured_voice_does_not_fallback_to_say(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AgentVoiceConfig(
+                config_path=Path(tmp) / "config.toml",
+                voice_backend="openai_tts",
+                voice_name="coral",
+            )
+            router = DeliveryRouter(config)
+
+            with (
+                patch(
+                    "agent_voice.delivery.router.resolve_openai_api_key",
+                    return_value=(None, SimpleNamespace(source="missing")),
+                ),
+                patch.object(router, "_say") as say,
+            ):
+                result = router.deliver_configured_voice("Test.")
+
+            self.assertFalse(result.delivered)
+            self.assertEqual(result.channel, "openai_tts")
+            say.assert_not_called()
+
     def test_voice_stop_request_prevents_playback_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AgentVoiceConfig(

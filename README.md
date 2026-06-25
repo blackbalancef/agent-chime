@@ -40,7 +40,13 @@ Then run the setup wizard:
 voiccce setup
 ```
 
-You'll get an interactive checkbox picker — use `↑`/`↓` to move, `space` to toggle Claude Code, Codex, and/or `pi`, and `enter` to install. Claude Code + Codex are pre-selected.
+The wizard walks you through arrow-key menus:
+
+1. **Agents** — a checkbox picker: `↑`/`↓` to move, `space` to toggle Claude Code, Codex, and/or `pi`, `a` for all, `enter` to confirm. Claude Code + Codex are pre-selected.
+2. **Language** — type the language for spoken summaries, such as `English`, `Russian`, `Spanish`, or `Japanese`.
+3. **Voice** — pick **OpenAI TTS** (natural cloud voice; prompts for your API key and stores it in the macOS Keychain) or the **macOS built-in voice** (offline, free, no key).
+4. **Menu bar** — a yes/no prompt to install and start the optional macOS menu bar app.
+5. **Stop-speaking hotkey** — when the menu bar app is enabled, pick the global shortcut (default `⌥⌘S`) that silences playback from any app, or choose Off.
 
 <details>
 <summary>Prefer manual steps? (you already have pipx)</summary>
@@ -54,18 +60,23 @@ voiccce setup
 
 </details>
 
-No OpenAI API key? Use the built-in macOS voice:
+No OpenAI API key? Pick the macOS voice in the wizard, or skip the picker with:
 
 ```bash
 voiccce setup --local
 ```
 
-To skip the picker, pass targets explicitly: `voiccce setup claude-code`, `codex`, `pi`, or `both` (claude-code + codex).
+Flags skip the matching menu when you already know what you want:
+
+- Agents: pass a target — `voiccce setup claude-code`, `codex`, `pi`, or `both` (claude-code + codex).
+- Language: `--language Spanish` (or any language name you want the AI summaries translated into).
+- Voice: `--openai` (cloud) or `--local` (macOS).
+- Menu bar: `--menubar` or `--no-menubar`.
 
 <details>
 <summary>What does setup configure?</summary>
 
-`voiccce setup` configures OpenAI TTS with voice `marin` (or macOS `say` with `--local`), stores your OpenAI key in the macOS Keychain when needed, installs hooks/extensions, starts the daemon, sends a test notification, and offers to install and start the optional menu bar app.
+`voiccce setup` first asks which agents to wire, which language to speak, which voice to use (and, for OpenAI TTS, your API key), and whether to install the menu bar app — all up front. Then it: configures the voice (OpenAI TTS with voice `marin`, or macOS `say` with voice `Alex`), stores your OpenAI key in the macOS Keychain when needed, installs hooks/extensions, starts the daemon, installs and starts the optional menu bar app if you chose to, and finally sends a test notification you should hear.
 
 If Codex was already running, restart the Codex app or `codex app-server`, then open `/hooks` in Codex and trust the Voiccce hooks.
 
@@ -90,9 +101,11 @@ Voiccce is currently alpha. The core workflow is usable, but CLI and configurati
 - Grouping and deduplication: repeated lifecycle events are batched and cooled down.
 - Spoken summary delivery: OpenAI TTS, macOS `say`, desktop notifications, and terminal logs.
 - Runtime controls: stop speech, mute temporarily, or manage the daemon from the CLI.
-- Optional menu bar app: quick mute, stop-speaking, daemon, config, log, and spend controls.
+- Global stop-speaking hotkey (menu bar app only): while the menu bar app runs, a system-wide shortcut (default `⌥⌘S`) silences the current announcement from any app — no Accessibility permission required.
+- Optional menu bar app: quick mute, stop-speaking, language entry, the stop-hotkey picker, daemon, config, log, and spend controls.
 - AI summaries: completed-session updates can be rewritten into concise spoken reports.
-- English and Russian message templates.
+- AI summary translation: choose any target language name for rewritten spoken summaries.
+- English and Russian template-only message text.
 
 ## Menu bar
 
@@ -103,7 +116,18 @@ pipx inject voiccce pyobjc-framework-Cocoa
 voiccce menubar-start
 ```
 
-It shows estimated spend and audio stats, and offers Stop Speaking, Mute 10 min / 1 hour, Unmute, Start/Stop Daemon, Open Config, and Open Daemon Log.
+It shows estimated spend and audio stats, and offers Stop Speaking, Notification language, a Stop hotkey picker, Mute 10 min / 1 hour, Unmute, Start/Stop Daemon, Open Config, and Open Daemon Log.
+
+### Stop-speaking hotkey
+
+While the menu bar app is running, a global keyboard shortcut instantly stops the current voice playback — even when another app is focused, so you can silence Voiccce mid-meeting without switching windows. The default is `⌥⌘S` (Option-Command-S). It registers through Carbon, so it needs **no Accessibility or Input-Monitoring permission**, and only the chosen combination is ever captured.
+
+Change it from the menu bar (`Stop hotkey ▸`), during `voiccce setup`, or from the CLI:
+
+```bash
+voiccce config --hotkey "ctrl+alt+cmd+."   # set a new combo (cmd, ctrl, alt, shift + a key)
+voiccce config --hotkey off                 # disable it
+```
 
 ```bash
 voiccce stop-speaking
@@ -150,7 +174,7 @@ Everything Voiccce stores lives under `~/.voiccce/`, including `config.toml`, `e
 The main config file is `~/.voiccce/config.toml`. Restart the daemon after manual edits.
 
 ```bash
-voiccce config --language ru
+voiccce config --language Spanish
 voiccce config --voice cedar
 voiccce config --voice-backend macos_say
 voiccce config --voice-backend openai_tts --voice marin

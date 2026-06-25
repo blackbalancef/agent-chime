@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +17,12 @@ from .config import AgentVoiceConfig
 class SecretStatus:
     source: str
     available: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIKeyValidation:
+    ok: bool
+    error: str | None = None
 
 
 def resolve_openai_api_key(config: AgentVoiceConfig) -> tuple[str | None, SecretStatus]:
@@ -32,6 +42,42 @@ def resolve_openai_api_key(config: AgentVoiceConfig) -> tuple[str | None, Secret
         return keychain_value, SecretStatus(source="keychain", available=True)
 
     return None, SecretStatus(source="missing", available=False)
+
+
+def validate_openai_tts_key(
+    config: AgentVoiceConfig,
+    api_key: str,
+    *,
+    voice: str | None = None,
+    model: str | None = None,
+) -> OpenAIKeyValidation:
+    """Validate an OpenAI key by generating a tiny TTS response without playback."""
+    payload = {
+        "model": model or config.voice_model,
+        "voice": voice or config.voice_name or "marin",
+        "input": "Voiccce key check.",
+        "response_format": config.voice_format,
+        "speed": 1.0,
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/audio/speech",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-Client-Request-Id": uuid.uuid4().hex,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=config.voice_timeout_seconds) as response:
+            response.read()
+        return OpenAIKeyValidation(ok=True)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return OpenAIKeyValidation(ok=False, error=f"HTTP {exc.code}: {body[:300]}")
+    except Exception as exc:
+        return OpenAIKeyValidation(ok=False, error=str(exc))
 
 
 def get_dotenv_secret(path: Path, key: str) -> str | None:

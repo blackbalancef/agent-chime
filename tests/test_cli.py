@@ -3,13 +3,26 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from agent_voice.cli import _maybe_setup_menubar, _menubar_install_command, _resolve_setup_targets, main
+from agent_voice.cli import (
+    _apply_stop_hotkey,
+    _maybe_setup_menubar,
+    _menubar_install_command,
+    _resolve_update_source,
+    _resolve_menubar_choice,
+    _resolve_setup_targets,
+    _resolve_setup_language,
+    _resolve_stop_hotkey,
+    _resolve_voice_backend,
+    _update_install_command,
+    build_parser,
+    main,
+)
 from agent_voice.config import load_config, set_voice_config, write_default_config
 from agent_voice.runtime import set_active_voice_sessions
 
@@ -165,11 +178,17 @@ class CliTests(unittest.TestCase):
 
 class SetupCommandTests(unittest.TestCase):
     def setUp(self) -> None:
-        # Keep setup tests hermetic: the menu bar step prompts/installs and is
-        # covered separately in SetupMenubarTests.
+        # Keep setup tests hermetic: the menu bar step installs/starts and is
+        # covered separately in MenubarSetupTests.
         patcher = patch("agent_voice.cli._maybe_setup_menubar")
         patcher.start()
         self.addCleanup(patcher.stop)
+        validation_patcher = patch(
+            "agent_voice.cli.validate_openai_tts_key",
+            return_value=SimpleNamespace(ok=True, error=None),
+        )
+        self.validate_key = validation_patcher.start()
+        self.addCleanup(validation_patcher.stop)
 
     def _fake_claude(self, **kwargs):
         return SimpleNamespace(settings_path=Path("/tmp/settings.json"))
@@ -214,7 +233,10 @@ class SetupCommandTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {}, clear=False),
-                patch("agent_voice.cli.get_openai_secret_status", return_value=SimpleNamespace(available=False, source="missing")),
+                patch(
+                    "agent_voice.cli.resolve_openai_api_key",
+                    return_value=(None, SimpleNamespace(available=False, source="missing")),
+                ),
                 patch("agent_voice.cli.getpass.getpass", return_value="sk-from-prompt"),
                 patch("agent_voice.cli.set_openai_keychain_secret", save_key),
                 patch("agent_voice.cli.install_claude_code_personal", side_effect=self._fake_claude),
@@ -226,6 +248,71 @@ class SetupCommandTests(unittest.TestCase):
 
             save_key.assert_called_once()
             self.assertEqual(save_key.call_args.args[1], "sk-from-prompt")
+            self.validate_key.assert_called()
+
+    def test_setup_rejects_invalid_entered_openai_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            save_key = MagicMock()
+            self.validate_key.return_value = SimpleNamespace(ok=False, error="HTTP 401: nope")
+
+            with (
+                patch(
+                    "agent_voice.cli.resolve_openai_api_key",
+                    return_value=(None, SimpleNamespace(available=False, source="missing")),
+                ),
+                patch("agent_voice.cli.getpass.getpass", return_value="sk-bad"),
+                patch("agent_voice.cli.set_openai_keychain_secret", save_key),
+                patch("agent_voice.cli.install_claude_code_personal", side_effect=self._fake_claude) as install,
+                patch("agent_voice.cli.start_daemon") as start,
+                redirect_stdout(StringIO()),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--config", str(config_path), "setup", "claude-code"])
+
+            self.assertIn("validation failed", str(raised.exception))
+            save_key.assert_not_called()
+            install.assert_not_called()
+            start.assert_not_called()
+
+    def test_setup_rejects_invalid_existing_key_non_interactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            self.validate_key.return_value = SimpleNamespace(ok=False, error="HTTP 401: nope")
+
+            with (
+                patch(
+                    "agent_voice.cli.resolve_openai_api_key",
+                    return_value=("sk-bad", SimpleNamespace(available=True, source="keychain")),
+                ),
+                patch("agent_voice.cli._interactive", return_value=False),
+                patch("agent_voice.cli.getpass.getpass") as prompt,
+                patch("agent_voice.cli.install_claude_code_personal", side_effect=self._fake_claude) as install,
+                redirect_stdout(StringIO()),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--config", str(config_path), "setup", "claude-code"])
+
+            self.assertIn("--reset-key", str(raised.exception))
+            prompt.assert_not_called()
+            install.assert_not_called()
+
+    def test_setup_saves_explicit_hotkey(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+
+            with (
+                patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}),
+                patch("agent_voice.cli.install_claude_code_personal", side_effect=self._fake_claude),
+                patch("agent_voice.cli.start_daemon", return_value=1),
+                patch("agent_voice.cli.DeliveryRouter", return_value=self._router_mock()),
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "setup", "claude-code", "--hotkey", "ctrl+alt+cmd+s"])
+
+            config = load_config(config_path)
+            self.assertTrue(config.hotkey_enabled)
+            self.assertEqual(config.hotkey_stop_speaking, "ctrl+alt+cmd+s")
 
     def test_setup_claude_only_skips_codex(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,6 +348,77 @@ class SetupCommandTests(unittest.TestCase):
             config = load_config(config_path)
             self.assertEqual(config.voice_backend, "macos_say")
             getpass_mock.assert_not_called()
+
+    def test_setup_interactive_picks_macos_skips_key(self) -> None:
+        # When the voice picker returns the macOS backend, no key is requested.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            getpass_mock = MagicMock()
+
+            with (
+                patch("agent_voice.cli.getpass.getpass", getpass_mock),
+                patch("agent_voice.cli._resolve_voice_backend", return_value="macos_say"),
+                patch("agent_voice.cli.install_claude_code_personal", side_effect=self._fake_claude),
+                patch("agent_voice.cli.start_daemon", return_value=1),
+                patch("agent_voice.cli.DeliveryRouter", return_value=self._router_mock()),
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "setup", "claude-code"])
+
+            config = load_config(config_path)
+            self.assertEqual(config.voice_backend, "macos_say")
+            getpass_mock.assert_not_called()
+
+    def test_setup_openai_flag_uses_openai_tts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+
+            with (
+                patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}),
+                patch("agent_voice.cli.install_claude_code_personal", side_effect=self._fake_claude),
+                patch("agent_voice.cli.start_daemon", return_value=1),
+                patch("agent_voice.cli.DeliveryRouter", return_value=self._router_mock()),
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "setup", "claude-code", "--openai"])
+
+            config = load_config(config_path)
+            self.assertEqual(config.voice_backend, "openai_tts")
+            self.assertEqual(config.voice_name, "marin")
+
+    def test_setup_cancel_after_voice_choice_does_not_prompt_for_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            key_status = MagicMock(return_value=SimpleNamespace(available=False, source="missing"))
+
+            with (
+                patch("agent_voice.cli._resolve_setup_language", return_value=None),
+                patch("agent_voice.cli._resolve_voice_backend", return_value="openai_tts"),
+                patch("agent_voice.cli._resolve_menubar_choice", side_effect=SystemExit(0)),
+                patch("agent_voice.cli.resolve_openai_api_key", key_status),
+                patch("agent_voice.cli.getpass.getpass") as getpass_mock,
+                redirect_stdout(StringIO()),
+            ):
+                with self.assertRaises(SystemExit):
+                    main(["--config", str(config_path), "setup", "claude-code"])
+
+            key_status.assert_not_called()
+            getpass_mock.assert_not_called()
+
+    def test_setup_language_flag_saves_custom_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+
+            with (
+                patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}),
+                patch("agent_voice.cli.install_claude_code_personal", side_effect=self._fake_claude),
+                patch("agent_voice.cli.start_daemon", return_value=1),
+                patch("agent_voice.cli.DeliveryRouter", return_value=self._router_mock()),
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "setup", "claude-code", "--language", "Spanish"])
+
+            self.assertEqual(load_config(config_path).language, "Spanish")
 
     def test_setup_no_test_skips_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -351,7 +509,445 @@ class ResolveSetupTargetsTests(unittest.TestCase):
                 _resolve_setup_targets(None)
 
 
+class ResolveSetupLanguageTests(unittest.TestCase):
+    def _args(self, language=None) -> SimpleNamespace:
+        return SimpleNamespace(language=language)
 
+    def test_explicit_language_flag_returns_value(self):
+        with patch("builtins.input") as prompt:
+            self.assertEqual(_resolve_setup_language(self._args("Spanish"), default="en"), "Spanish")
+        prompt.assert_not_called()
+
+    def test_non_tty_leaves_existing_config(self):
+        with (
+            patch("agent_voice.cli._interactive", return_value=False),
+            patch("builtins.input") as prompt,
+        ):
+            self.assertIsNone(_resolve_setup_language(self._args(), default="en"))
+        prompt.assert_not_called()
+
+    def test_tty_accepts_typed_language(self):
+        with (
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("builtins.input", return_value="Spanish") as prompt,
+        ):
+            self.assertEqual(_resolve_setup_language(self._args(), default="en"), "Spanish")
+        prompt.assert_called_once()
+
+    def test_tty_empty_input_keeps_default(self):
+        with (
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("builtins.input", return_value=""),
+        ):
+            self.assertEqual(_resolve_setup_language(self._args(), default="ru"), "ru")
+
+
+class ResolveVoiceBackendTests(unittest.TestCase):
+    def _args(self, *, local: bool = False, openai: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(local=local, openai=openai)
+
+    def test_local_flag_returns_macos_say(self):
+        self.assertEqual(_resolve_voice_backend(self._args(local=True)), "macos_say")
+
+    def test_openai_flag_returns_openai_tts(self):
+        self.assertEqual(_resolve_voice_backend(self._args(openai=True)), "openai_tts")
+
+    def test_non_tty_defaults_to_openai(self):
+        with patch("agent_voice.cli._interactive", return_value=False):
+            self.assertEqual(_resolve_voice_backend(self._args()), "openai_tts")
+
+    def test_tty_runs_picker(self):
+        with (
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("agent_voice.cli.select_one", return_value="macos_say") as picker,
+        ):
+            result = _resolve_voice_backend(self._args())
+        self.assertEqual(result, "macos_say")
+        picker.assert_called_once()
+        self.assertEqual(picker.call_args.kwargs["default"], "openai_tts")
+
+    def test_tty_cancel_exits(self):
+        with (
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("agent_voice.cli.select_one", return_value=None),
+        ):
+            with self.assertRaises(SystemExit):
+                _resolve_voice_backend(self._args())
+
+
+class SetupParserTests(unittest.TestCase):
+    def test_local_and_openai_are_mutually_exclusive(self):
+        # argparse must reject choosing both voice backends at once.
+        with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+            build_parser().parse_args(["setup", "--local", "--openai"])
+
+
+class ResolveMenubarChoiceTests(unittest.TestCase):
+    def _args(self, menubar) -> SimpleNamespace:
+        return SimpleNamespace(menubar=menubar)
+
+    def test_explicit_true_and_false(self):
+        self.assertIs(_resolve_menubar_choice(self._args(True)), True)
+        self.assertIs(_resolve_menubar_choice(self._args(False)), False)
+
+    def test_non_darwin_returns_none(self):
+        with patch("agent_voice.cli.sys.platform", "linux"):
+            self.assertIsNone(_resolve_menubar_choice(self._args(None)))
+
+    def test_darwin_non_tty_returns_none(self):
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._interactive", return_value=False),
+        ):
+            self.assertIsNone(_resolve_menubar_choice(self._args(None)))
+
+    def test_darwin_tty_yes(self):
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("agent_voice.cli.select_one", return_value="yes") as ask,
+        ):
+            self.assertIs(_resolve_menubar_choice(self._args(None)), True)
+        ask.assert_called_once()
+
+    def test_darwin_tty_no(self):
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("agent_voice.cli.select_one", return_value="no"),
+        ):
+            self.assertIs(_resolve_menubar_choice(self._args(None)), False)
+
+    def test_darwin_tty_cancel_exits(self):
+        # esc must abort the whole wizard, like the agents and voice menus.
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("agent_voice.cli.select_one", return_value=None),
+        ):
+            with self.assertRaises(SystemExit):
+                _resolve_menubar_choice(self._args(None))
+
+
+class ResolveStopHotkeyTests(unittest.TestCase):
+    def _args(self, hotkey=None) -> SimpleNamespace:
+        return SimpleNamespace(hotkey=hotkey)
+
+    def test_explicit_flag_bypasses_prompt(self):
+        with patch("agent_voice.cli.select_one") as picker:
+            self.assertEqual(
+                _resolve_stop_hotkey(self._args("ctrl+alt+cmd+s"), menubar_enabled=True),
+                "ctrl+alt+cmd+s",
+            )
+        picker.assert_not_called()
+
+    def test_no_menubar_returns_none(self):
+        with patch("agent_voice.cli.select_one") as picker:
+            self.assertIsNone(_resolve_stop_hotkey(self._args(), menubar_enabled=False))
+        picker.assert_not_called()
+
+    def test_non_darwin_returns_none(self):
+        with (
+            patch("agent_voice.cli.sys.platform", "linux"),
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("agent_voice.cli.select_one") as picker,
+        ):
+            self.assertIsNone(_resolve_stop_hotkey(self._args(), menubar_enabled=True))
+        picker.assert_not_called()
+
+    def test_non_tty_returns_none(self):
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._interactive", return_value=False),
+            patch("agent_voice.cli.select_one") as picker,
+        ):
+            self.assertIsNone(_resolve_stop_hotkey(self._args(), menubar_enabled=True))
+        picker.assert_not_called()
+
+    def test_darwin_tty_runs_picker(self):
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("agent_voice.cli.select_one", return_value="ctrl+alt+cmd+.") as picker,
+        ):
+            result = _resolve_stop_hotkey(self._args(), menubar_enabled=True)
+        self.assertEqual(result, "ctrl+alt+cmd+.")
+        picker.assert_called_once()
+        self.assertEqual(picker.call_args.kwargs["default"], "alt+cmd+s")
+
+    def test_picker_cancel_exits(self):
+        with (
+            patch("agent_voice.cli.sys.platform", "darwin"),
+            patch("agent_voice.cli._interactive", return_value=True),
+            patch("agent_voice.cli.select_one", return_value=None),
+        ):
+            with self.assertRaises(SystemExit):
+                _resolve_stop_hotkey(self._args(), menubar_enabled=True)
+
+
+class ApplyStopHotkeyTests(unittest.TestCase):
+    def test_none_leaves_config_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            with redirect_stdout(StringIO()):
+                _apply_stop_hotkey(config_path, None)
+            config = load_config(config_path)
+            self.assertTrue(config.hotkey_enabled)
+            self.assertEqual(config.hotkey_stop_speaking, "alt+cmd+s")
+
+    def test_spec_is_persisted_canonically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with redirect_stdout(StringIO()):
+                _apply_stop_hotkey(config_path, "Command+Option+S")
+            config = load_config(config_path)
+            self.assertTrue(config.hotkey_enabled)
+            self.assertEqual(config.hotkey_stop_speaking, "alt+cmd+s")
+
+    def test_off_disables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with redirect_stdout(StringIO()):
+                _apply_stop_hotkey(config_path, "off")
+            self.assertFalse(load_config(config_path).hotkey_enabled)
+
+    def test_invalid_spec_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
+                _apply_stop_hotkey(config_path, "cmd+nope")
+
+    def test_all_off_tokens_disable(self) -> None:
+        from agent_voice.cli import _HOTKEY_OFF_TOKENS
+
+        for token in sorted(t for t in _HOTKEY_OFF_TOKENS if t):
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "config.toml"
+                set_voice_config(config_path)  # materialize a config first
+                with redirect_stdout(StringIO()):
+                    _apply_stop_hotkey(config_path, token)
+                self.assertFalse(load_config(config_path).hotkey_enabled, token)
+
+
+class ConfigCommandHotkeyTests(unittest.TestCase):
+    def _run_config(self, config_path: Path, *args: str) -> str:
+        out = StringIO()
+        with redirect_stdout(out):
+            main(["--config", str(config_path), "config", *args])
+        return out.getvalue()
+
+    def test_set_custom_language_persists_and_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            output = self._run_config(config_path, "--language", "Spanish")
+            self.assertEqual(load_config(config_path).language, "Spanish")
+            self.assertIn("Language: Spanish", output)
+
+    def test_set_valid_hotkey_persists_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            output = self._run_config(config_path, "--hotkey", "Command+Option+S")
+            config = load_config(config_path)
+            self.assertTrue(config.hotkey_enabled)
+            self.assertEqual(config.hotkey_stop_speaking, "alt+cmd+s")
+            self.assertIn("Stop-speaking hotkey: ⌥⌘S", output)
+
+    def test_off_disables_and_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            output = self._run_config(config_path, "--hotkey", "off")
+            self.assertFalse(load_config(config_path).hotkey_enabled)
+            self.assertIn("Stop-speaking hotkey: off", output)
+
+    def test_invalid_hotkey_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            with self.assertRaises(SystemExit), redirect_stdout(StringIO()):
+                main(["--config", str(config_path), "config", "--hotkey", "cmd+nope"])
+
+
+class SecretCommandTests(unittest.TestCase):
+    def test_secret_set_validates_before_saving(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            save_key = MagicMock()
+
+            with (
+                patch("agent_voice.cli.getpass.getpass", return_value="sk-good"),
+                patch(
+                    "agent_voice.cli.validate_openai_tts_key",
+                    return_value=SimpleNamespace(ok=True, error=None),
+                ) as validate,
+                patch("agent_voice.cli.set_openai_keychain_secret", save_key),
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "secret", "set", "openai"])
+
+            validate.assert_called_once()
+            save_key.assert_called_once()
+            self.assertEqual(save_key.call_args.args[1], "sk-good")
+
+    def test_secret_set_rejects_invalid_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            save_key = MagicMock()
+
+            with (
+                patch("agent_voice.cli.getpass.getpass", return_value="sk-bad"),
+                patch(
+                    "agent_voice.cli.validate_openai_tts_key",
+                    return_value=SimpleNamespace(ok=False, error="HTTP 401: nope"),
+                ),
+                patch("agent_voice.cli.set_openai_keychain_secret", save_key),
+                redirect_stdout(StringIO()),
+            ):
+                with self.assertRaises(SystemExit):
+                    main(["--config", str(config_path), "secret", "set", "openai"])
+
+            save_key.assert_not_called()
+
+
+class UpdateCommandTests(unittest.TestCase):
+    def _source_checkout(self, root: Path) -> Path:
+        source = root / "voiccce"
+        source.mkdir()
+        (source / "pyproject.toml").write_text("[project]\nname = \"voiccce\"\n", encoding="utf-8")
+        (source / "agent_voice").mkdir()
+        return source
+
+    def test_update_install_command_uses_pipx_runpip_inside_pipx_venv(self) -> None:
+        source = Path("/work/voiccce")
+        with (
+            patch("agent_voice.cli.sys.prefix", "/Users/me/.local/pipx/venvs/voiccce"),
+            patch("agent_voice.cli.shutil.which", return_value="/opt/homebrew/bin/pipx"),
+        ):
+            command = _update_install_command(source)
+
+        self.assertEqual(
+            command,
+            [
+                "pipx",
+                "runpip",
+                "voiccce",
+                "install",
+                "--force-reinstall",
+                "--no-deps",
+                "-e",
+                str(source),
+            ],
+        )
+
+    def test_update_install_command_falls_back_to_current_python(self) -> None:
+        source = Path("/work/voiccce")
+        with (
+            patch("agent_voice.cli.sys.prefix", "/tmp/venv"),
+            patch("agent_voice.cli.shutil.which", return_value=None),
+        ):
+            command = _update_install_command(source)
+
+        self.assertEqual(
+            command,
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--force-reinstall",
+                "--no-deps",
+                "-e",
+                str(source),
+            ],
+        )
+
+    def test_update_install_command_detects_pipx_app_on_path(self) -> None:
+        source = Path("/work/voiccce")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "pipx" / "venvs" / "voiccce" / "bin" / "voiccce"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            def which(name: str) -> str | None:
+                if name == "voiccce":
+                    return str(script)
+                if name == "pipx":
+                    return "/opt/homebrew/bin/pipx"
+                return None
+
+            with (
+                patch("agent_voice.cli.sys.prefix", "/usr/local"),
+                patch("agent_voice.cli.shutil.which", side_effect=which),
+            ):
+                command = _update_install_command(source)
+
+        self.assertEqual(command[:3], ["pipx", "runpip", "voiccce"])
+
+    def test_resolve_update_source_accepts_explicit_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self._source_checkout(Path(tmp))
+            self.assertEqual(_resolve_update_source(str(source)), source.resolve())
+
+    def test_resolve_update_source_uses_installed_direct_url_when_not_in_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_checkout(root)
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            with (
+                patch("agent_voice.cli.Path.cwd", return_value=elsewhere),
+                patch("agent_voice.cli._installed_source_path", return_value=source),
+            ):
+                self.assertEqual(_resolve_update_source(None), source.resolve())
+
+    def test_update_restarts_running_services_after_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_checkout(root)
+            config_path = root / "config.toml"
+
+            with (
+                patch("agent_voice.cli._update_install_command", return_value=["install"]) as command,
+                patch("agent_voice.cli.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+                patch("agent_voice.cli.daemon_status", return_value=(111, True)),
+                patch("agent_voice.cli.menubar_status", return_value=(222, True)),
+                patch("agent_voice.cli.stop_daemon", return_value=111) as stop_daemon_mock,
+                patch("agent_voice.cli.start_daemon", return_value=333) as start_daemon_mock,
+                patch("agent_voice.cli.stop_menubar", return_value=222) as stop_menubar_mock,
+                patch("agent_voice.cli.start_menubar", return_value=444) as start_menubar_mock,
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "update", "--source", str(source)])
+
+            command.assert_called_once_with(source.resolve())
+            run.assert_called_once_with(["install"], cwd=str(source.resolve()))
+            stop_daemon_mock.assert_called_once()
+            start_daemon_mock.assert_called_once()
+            stop_menubar_mock.assert_called_once()
+            start_menubar_mock.assert_called_once()
+
+    def test_update_failure_does_not_restart_services(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_checkout(root)
+            config_path = root / "config.toml"
+
+            with (
+                patch("agent_voice.cli._update_install_command", return_value=["install"]),
+                patch("agent_voice.cli.subprocess.run", return_value=SimpleNamespace(returncode=2)),
+                patch("agent_voice.cli.daemon_status", return_value=(111, True)),
+                patch("agent_voice.cli.menubar_status", return_value=(222, True)),
+                patch("agent_voice.cli.stop_daemon") as stop_daemon_mock,
+                patch("agent_voice.cli.stop_menubar") as stop_menubar_mock,
+                redirect_stdout(StringIO()),
+            ):
+                with self.assertRaises(SystemExit):
+                    main(["--config", str(config_path), "update", "--source", str(source)])
+
+            stop_daemon_mock.assert_not_called()
+            stop_menubar_mock.assert_not_called()
+
+
+class MenubarSetupTests(unittest.TestCase):
     def _config(self) -> SimpleNamespace:
         return SimpleNamespace(config_path=Path("/tmp/config.toml"))
 
@@ -405,38 +1001,18 @@ class ResolveSetupTargetsTests(unittest.TestCase):
         start.assert_not_called()
         self.assertIn("install failed", out.getvalue())
 
-    def test_choice_none_non_tty_skips(self) -> None:
+    def test_choice_none_skips(self) -> None:
+        # None means "no decision" (non-macOS or non-interactive); the prompt is
+        # now handled up front by _resolve_menubar_choice, so this never installs.
         with (
             patch("agent_voice.cli.sys.platform", "darwin"),
-            patch("agent_voice.cli.sys.stdin.isatty", return_value=False),
             patch("agent_voice.cli.start_menubar") as start,
+            patch("agent_voice.cli.subprocess.run") as run,
             redirect_stdout(StringIO()),
         ):
             _maybe_setup_menubar(self._config(), choice=None)
         start.assert_not_called()
-
-    def test_choice_none_tty_default_yes_starts(self) -> None:
-        with (
-            patch("agent_voice.cli.sys.platform", "darwin"),
-            patch("agent_voice.cli.sys.stdin.isatty", return_value=True),
-            patch("agent_voice.cli.confirm", return_value=True),
-            patch("agent_voice.cli._cocoa_available", return_value=True),
-            patch("agent_voice.cli.start_menubar", return_value=7) as start,
-            redirect_stdout(StringIO()),
-        ):
-            _maybe_setup_menubar(self._config(), choice=None)
-        start.assert_called_once()
-
-    def test_choice_none_tty_no_skips(self) -> None:
-        with (
-            patch("agent_voice.cli.sys.platform", "darwin"),
-            patch("agent_voice.cli.sys.stdin.isatty", return_value=True),
-            patch("agent_voice.cli.confirm", return_value=False),
-            patch("agent_voice.cli.start_menubar") as start,
-            redirect_stdout(StringIO()),
-        ):
-            _maybe_setup_menubar(self._config(), choice=None)
-        start.assert_not_called()
+        run.assert_not_called()
 
     def test_non_darwin_skips_even_when_forced(self) -> None:
         out = StringIO()

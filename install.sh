@@ -90,16 +90,28 @@ fi
 
 # --- 4. install Voiccce --------------------------------------------------
 info "Installing Voiccce"
+# `pipx install --force` recreates the venv. When pipx delegates venv creation
+# to uv, uv refuses to overwrite an existing venv unless told to clear it, so a
+# plain re-run fails with "a virtual environment already exists". UV_VENV_CLEAR
+# opts into that; it is ignored on a fresh install and by pipx's stdlib-venv
+# backend, so it is always safe. If a force install still fails (e.g. a venv left
+# half-written by an earlier crash), fall back to a clean uninstall + install.
 # shellcheck disable=SC2086
-run ${PIPX} install --force "${SRC}"
+if ! run env UV_VENV_CLEAR=1 ${PIPX} install --force "${SRC}"; then
+  warn "Reinstalling from a clean virtual environment"
+  # shellcheck disable=SC2086
+  ${PIPX} uninstall voiccce >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  run env UV_VENV_CLEAR=1 ${PIPX} install "${SRC}"
+fi
 hash -r 2>/dev/null || true
 
 # --- 5. next steps -------------------------------------------------------
 echo
 if command -v voiccce >/dev/null 2>&1; then
-  ok "Installed. Run the setup wizard:"
-  printf '%s\n' "    ${BOLD}voiccce setup${RESET}             ${DIM}# arrow-key checkbox picker${RESET}"
-  printf '%s\n' "    ${BOLD}voiccce setup --local${RESET}      ${DIM}# offline macOS voice (no API key)${RESET}"
+  ok "Installed. Run the interactive setup wizard:"
+  printf '%s\n' "    ${BOLD}voiccce setup${RESET}             ${DIM}# pick agents, voice, and menu bar in arrow-key menus${RESET}"
+  printf '%s\n' "    ${BOLD}voiccce setup --local${RESET}      ${DIM}# skip the voice picker, use the offline macOS voice${RESET}"
 else
   ok "Installed, but ${BOLD}voiccce${RESET} is not on your PATH yet."
   printf '%s\n' "    Open a new terminal (or run ${BOLD}exec \$SHELL${RESET}), then:"

@@ -296,7 +296,15 @@ class MultiSelect:
 
     def _render(self) -> None:
         out = self.stream
-        lines = self._build_frame()
+        # Flatten multi-line entries (e.g. the title card) into physical lines.
+        # In raw mode ``tty.setraw`` clears ONLCR, so a bare "\n" is a line feed
+        # with no carriage return: a multi-line string would staircase to the
+        # right, and counting it as one line would desync the cursor-up redraw.
+        # Splitting here keeps every emitted line column-0 anchored and makes
+        # ``_drawn`` the true physical-line count.
+        lines: list[str] = []
+        for entry in self._build_frame():
+            lines.extend(entry.split("\n"))
         if self._drawn > 0:
             out.write(f"\033[{self._drawn}A")
         for line in lines:
