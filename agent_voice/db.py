@@ -83,6 +83,17 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 CREATE INDEX IF NOT EXISTS idx_notifications_created
     ON notifications(created_at);
+
+CREATE TABLE IF NOT EXISTS pending_reminders (
+    session_id TEXT PRIMARY KEY,
+    agent_name TEXT NOT NULL,
+    project_name TEXT,
+    due_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_reminders_due
+    ON pending_reminders(due_at);
 """
 
 MIGRATED_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -323,6 +334,62 @@ def clear_notifications(conn: sqlite3.Connection) -> int:
 
 def clear_session_states(conn: sqlite3.Connection) -> int:
     cursor = conn.execute("DELETE FROM session_states")
+    conn.commit()
+    return cursor.rowcount
+
+
+def schedule_reminder(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    agent_name: str,
+    project_name: str | None,
+    due_at: int,
+    created_at: int,
+) -> None:
+    """Schedule (or reschedule) a timed idle reminder for ``session_id``.
+
+    A later finish/idle for the same session overwrites ``due_at``, so only the
+    most recent waiting state ever fires.
+    """
+    conn.execute(
+        """
+        INSERT INTO pending_reminders (session_id, agent_name, project_name, due_at, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            agent_name = excluded.agent_name,
+            project_name = excluded.project_name,
+            due_at = excluded.due_at,
+            created_at = excluded.created_at
+        """,
+        (session_id, agent_name, project_name, int(due_at), int(created_at)),
+    )
+
+
+def cancel_reminder(conn: sqlite3.Connection, session_id: str) -> int:
+    """Cancel any pending reminder for ``session_id`` (e.g. the user replied)."""
+    cursor = conn.execute(
+        "DELETE FROM pending_reminders WHERE session_id = ?", (session_id,)
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def due_reminders(conn: sqlite3.Connection, now_epoch: int) -> list[sqlite3.Row]:
+    """Return reminders whose ``due_at`` has arrived, oldest first."""
+    return conn.execute(
+        """
+        SELECT session_id, agent_name, project_name, due_at, created_at
+        FROM pending_reminders
+        WHERE due_at <= ?
+        ORDER BY due_at ASC
+        """,
+        (int(now_epoch),),
+    ).fetchall()
+
+
+def clear_reminders(conn: sqlite3.Connection) -> int:
+    cursor = conn.execute("DELETE FROM pending_reminders")
     conn.commit()
     return cursor.rowcount
 

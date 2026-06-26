@@ -28,6 +28,7 @@ from .config import (
     reset_config,
     restore_config_backup,
     set_autostart_managed,
+    set_reminders_config,
     set_config_language,
     set_daemon_config,
     set_events_config,
@@ -41,8 +42,10 @@ from .config import (
 from .hotkey import DEFAULT_STOP_SPEAKING_HOTKEY, HOTKEY_PRESETS, format_hotkey_display
 from .daemon import in_quiet_hours, process_once, run_daemon
 from .db import (
+    cancel_reminder,
     clear_events,
     clear_notifications,
+    clear_reminders,
     clear_session_states,
     connect,
     db_size_bytes,
@@ -401,6 +404,8 @@ def build_parser() -> argparse.ArgumentParser:
     config_cmd.add_argument("--quiet-hours-to", help="Quiet-hours end, HH:MM (e.g. 09:00)")
     config_cmd.add_argument("--quiet-hours-voice", choices=["on", "off"], help="Allow voice during quiet hours")
     config_cmd.add_argument("--quiet-hours-desktop", choices=["on", "off"], help="Allow desktop notifications during quiet hours")
+    config_cmd.add_argument("--idle-reminders", choices=["on", "off"], help="Speak a short 'still waiting' nudge before the agent's cache expires")
+    config_cmd.add_argument("--idle-reminder-margin", type=int, metavar="MIN", help="Minutes before cache expiry to nudge (default 1)")
     config_cmd.add_argument("--reset", action="store_true", help="Reset config to defaults (a backup is written)")
     config_cmd.add_argument("--reset-section", help="Only reset this section (use with --reset), e.g. summary")
     config_cmd.add_argument("--list-backups", action="store_true", help="List config backups (newest first) and exit")
@@ -706,7 +711,9 @@ def cmd_setup(args: argparse.Namespace) -> None:
     _maybe_setup_menubar(config, choice=menubar_choice)
 
     if not args.no_test:
-        results = DeliveryRouter(config).deliver("Voiccce is ready.")
+        # Use the localized test phrase so the spoken test honors the configured
+        # language (e.g. Russian), not a hardcoded English string.
+        results = DeliveryRouter(config).deliver(test_message(config))
         if any(result.spoken for result in results):
             print("✓ Test sent — you should hear it now.")
         else:
@@ -1639,6 +1646,19 @@ def cmd_config(args: argparse.Namespace) -> None:
             raise SystemExit(str(exc))
         changed = True
 
+    reminder_options: dict[str, object] = {}
+    idle_reminders = _toggle_flag(args.idle_reminders, "--idle-reminders")
+    if idle_reminders is not None:
+        reminder_options["enabled"] = idle_reminders
+    if args.idle_reminder_margin is not None:
+        reminder_options["margin_minutes"] = args.idle_reminder_margin
+    if reminder_options:
+        try:
+            config_path = set_reminders_config(config_path, **reminder_options)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        changed = True
+
     config = load_config(args.config)
     normalize_language(config.language)
     print(f"Config: {config.config_path}")
@@ -1683,6 +1703,10 @@ def cmd_config(args: argparse.Namespace) -> None:
     print(f"Daily spend cap: {format_usd(config.daily_spend_cap_usd) if config.daily_spend_cap_usd else 'none'}")
     print(f"Monthly spend cap: {format_usd(config.monthly_spend_cap_usd) if config.monthly_spend_cap_usd else 'none'}")
     print(f"Event retention days: {config.event_retention_days or 'forever'}")
+    if config.idle_reminder_enabled:
+        print(f"Idle reminder: on (nudge {config.idle_reminder_margin_minutes} min before cache expiry)")
+    else:
+        print("Idle reminder: off")
     status = get_openai_secret_status(config)
     print(f"Voice API key status: {status.source if status.available else 'missing'}")
     if changed:
@@ -1735,9 +1759,12 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
 
 def _handle_user_activity(config: AgentVoiceConfig) -> None:
-    """Stop a playing announcement when the user replies into that same session."""
-    if not config.voice_interrupt_on_user_input:
-        return
+    """React to a user reply into a session.
+
+    Always cancels that session's pending idle reminder (the user is back, so there
+    is nothing to nudge about). Then, only when interrupt-on-reply is enabled and the
+    session is currently being spoken, cuts the playback short.
+    """
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
@@ -1750,10 +1777,31 @@ def _handle_user_activity(config: AgentVoiceConfig) -> None:
         or payload.get("conversation_id")
         or payload.get("run_id")
     )
-    if not session_id or not voice_session_active(config, str(session_id)):
+    if not session_id:
+        return
+    session_id = str(session_id)
+    _cancel_session_reminder(config, session_id)
+    if not config.voice_interrupt_on_user_input:
+        return
+    if not voice_session_active(config, session_id):
         return
     pid = stop_speaking(config)
     print(json.dumps({"interrupted": True, "session_id": session_id, "pid": pid}, ensure_ascii=False))
+
+
+def _cancel_session_reminder(config: AgentVoiceConfig, session_id: str) -> None:
+    """Best-effort: drop any pending idle reminder for ``session_id``."""
+    try:
+        conn = connect(config.database_path)
+    except Exception:  # pragma: no cover - defensive
+        return
+    try:
+        init_db(conn)
+        cancel_reminder(conn, session_id)
+    except Exception:  # pragma: no cover - never let a hook fail the agent
+        pass
+    finally:
+        conn.close()
 
 
 def cmd_enqueue_test_event(args: argparse.Namespace) -> None:
@@ -1935,7 +1983,11 @@ def cmd_clear(args: argparse.Namespace) -> None:
         if clear_history:
             notifications = clear_notifications(conn)
             sessions = clear_session_states(conn)
-            print(f"Cleared {notifications} notification(s) and {sessions} session state(s).")
+            reminders = clear_reminders(conn)
+            print(
+                f"Cleared {notifications} notification(s), {sessions} session state(s), "
+                f"and {reminders} pending reminder(s)."
+            )
     finally:
         conn.close()
     if clear_history:

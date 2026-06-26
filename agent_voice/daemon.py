@@ -10,14 +10,23 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .config import AgentVoiceConfig, load_config
-from .db import connect, fetch_pending_events, init_db, mark_events_processed, prune_processed_events, vacuum_db
+from .config import AgentVoiceConfig, cache_warm_minutes, load_config
+from .db import (
+    connect,
+    due_reminders,
+    fetch_pending_events,
+    init_db,
+    mark_events_processed,
+    prune_processed_events,
+    schedule_reminder,
+    vacuum_db,
+)
 from .delivery import DeliveryRouter
 from .heartbeat import write_heartbeat
 from .intelligence.fallback import build_grouped_message
 from .intelligence.pipeline_log import log_summary_pipeline
 from .intelligence.summarizer import summarize_notification
-from .models import EventType, NotificationCategory, now_ts, stable_hash
+from .models import EventType, NotificationCategory, SessionStatus, now_ts, stable_hash
 from .runtime import (
     clear_active_voice_sessions,
     read_runtime_state,
@@ -31,6 +40,16 @@ from .usage import fetch_usage_stats, start_of_day_epoch, start_of_month_epoch
 VACUUM_INTERVAL_SECONDS = 24 * 60 * 60
 # Voice channels that constitute a paid/spoken delivery for rate-limit accounting.
 VOICE_CHANNELS = ("openai_tts", "macos_say")
+# Session states that mean the agent has stopped and is waiting on the user, so a
+# timed idle reminder is worth scheduling.
+AWAITING_STATUSES = frozenset(
+    {
+        SessionStatus.COMPLETED,
+        SessionStatus.FAILED,
+        SessionStatus.ATTENTION_REQUIRED,
+        SessionStatus.PERMISSION_NEEDED,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +192,175 @@ def _recent_voice_delivery_count(conn: sqlite3.Connection, since: int) -> int:
     return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
 
+def _idle_reminder_delay_seconds(config: AgentVoiceConfig, agent_name: str | None) -> int:
+    """Seconds of inactivity before the idle reminder fires.
+
+    Derived from the agent's prompt-cache window minus the configured safety
+    margin, so the nudge lands while a reply still hits a warm cache (e.g. Claude's
+    ~5 min window with margin 1 → fire at 4 min). Floored at 1 minute.
+    """
+    window = cache_warm_minutes(agent_name)
+    minutes = max(1, window - max(0, config.idle_reminder_margin_minutes))
+    return minutes * 60
+
+
+def build_idle_reminder_message(
+    config: AgentVoiceConfig, agent_name: str | None, project_name: str | None
+) -> str:
+    """Render the short idle-reminder phrase in the configured language."""
+    templates = config.message_templates.get(config.language, {})
+    template = templates.get("idle_reminder") or "{project} is waiting for your reply."
+    agent_labels = {"claude-code": "Claude", "codex": "Codex", "pi": "Pi"}
+    agent_label = agent_labels.get((agent_name or "").lower(), agent_name or "the agent")
+    project = project_name or "your session"
+    remaining = max(1, cache_warm_minutes(agent_name) - max(0, config.idle_reminder_margin_minutes))
+    try:
+        return template.format(project=project, minutes=remaining, agent=agent_label)
+    except (KeyError, IndexError, ValueError):  # custom template with unknown fields
+        return f"{project} is waiting for your reply."
+
+
+def _schedule_idle_reminders(
+    conn: sqlite3.Connection,
+    config: AgentVoiceConfig,
+    candidates: list[NotificationCandidate],
+    current_time: int,
+) -> None:
+    """Schedule a timed reminder for every session now waiting on the user.
+
+    A later finish/idle for the same session reschedules (overwrites) its row, and a
+    user reply cancels it, so only the latest still-unanswered waiting state fires.
+    """
+    if not config.idle_reminder_enabled:
+        return
+    for candidate in candidates:
+        if candidate.status not in AWAITING_STATUSES:
+            continue
+        session_id = candidate.session_id
+        if not session_id or session_id == "default":
+            continue
+        schedule_reminder(
+            conn,
+            session_id=session_id,
+            agent_name=candidate.agent_name,
+            project_name=candidate.project_name,
+            due_at=current_time + _idle_reminder_delay_seconds(config, candidate.agent_name),
+            created_at=current_time,
+        )
+
+
+def deliver_due_reminders(
+    conn: sqlite3.Connection,
+    config: AgentVoiceConfig,
+    *,
+    current_time: int | None = None,
+    deliver: bool = True,
+    terminal_only: bool = False,
+) -> int:
+    """Speak any idle reminders whose timer has elapsed; return the count delivered.
+
+    Each due reminder is one-shot: it is removed after a single attempt so a still-idle
+    session is never nagged repeatedly. Reminders honor quiet hours, spend caps (fall
+    back to the free voice), and mute (handled by the router).
+    """
+    from .db import cancel_reminder
+
+    init_db(conn)
+    if not config.idle_reminder_enabled:
+        return 0
+    current_time = current_time or now_ts()
+    rows = due_reminders(conn, current_time)
+    if not rows:
+        return 0
+
+    delivered = 0
+    for row in rows:
+        session_id = row["session_id"] if isinstance(row, sqlite3.Row) else row[0]
+        agent_name = row["agent_name"] if isinstance(row, sqlite3.Row) else row[1]
+        project_name = row["project_name"] if isinstance(row, sqlite3.Row) else row[2]
+        message = build_idle_reminder_message(config, agent_name, project_name)
+
+        voice_allowed = config.voice_enabled
+        desktop_allowed = config.desktop_enabled
+        force_backend: str | None = None
+        suppressed_reason: str | None = None
+        if deliver and not terminal_only and in_quiet_hours(config):
+            if not config.quiet_hours_voice and voice_allowed:
+                voice_allowed = False
+                suppressed_reason = "quiet_hours"
+            if not config.quiet_hours_desktop:
+                desktop_allowed = False
+        if deliver and not terminal_only and voice_allowed:
+            if _spend_cap_reached(conn, config) is not None and config.voice_backend == "openai_tts":
+                force_backend = "macos_say"
+
+        channel = "none"
+        spoken = False
+        delivered_at = None
+        error = None
+        audio_generated = False
+        audio_duration_seconds = 0.0
+        audio_cost_usd = 0.0
+        if deliver:
+            overrides: dict[str, object] = {}
+            if not voice_allowed:
+                overrides["voice_enabled"] = False
+            if not desktop_allowed:
+                overrides["desktop_enabled"] = False
+            delivery_config = replace(config, **overrides) if overrides else config
+            router_kwargs: dict[str, object] = {"terminal_only": terminal_only}
+            if force_backend is not None:
+                router_kwargs["force_backend"] = force_backend
+            results = DeliveryRouter(delivery_config, **router_kwargs).deliver(message)
+            audio_generated = any(result.audio_generated for result in results)
+            audio_duration_seconds = sum(result.audio_duration_seconds for result in results)
+            audio_cost_usd = sum(result.audio_cost_usd for result in results)
+            successful = next((result for result in results if result.delivered), None)
+            if successful:
+                channel = successful.channel
+                spoken = successful.spoken
+                delivered_at = current_time
+                delivered += 1
+                _log(f"reminder via {channel} (cost ${audio_cost_usd:.4f}): {message}")
+            elif results:
+                channel = results[-1].channel
+                error = "; ".join(
+                    result.error or "delivery failed" for result in results if not result.delivered
+                )
+            if suppressed_reason and channel in {"none", ""}:
+                channel = suppressed_reason
+
+        conn.execute(
+            """
+            INSERT INTO notifications (
+                event_ids_json, category, channel, message, spoken,
+                audio_generated, audio_duration_seconds, audio_cost_usd,
+                summary_cost_usd, created_at, delivered_at, error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                json.dumps([], ensure_ascii=False),
+                NotificationCategory.NEEDS_ATTENTION.value,
+                channel,
+                message,
+                int(spoken),
+                int(audio_generated),
+                audio_duration_seconds,
+                audio_cost_usd,
+                0.0,
+                current_time,
+                delivered_at,
+                error,
+            ),
+        )
+        # One-shot: drop the reminder whether or not it managed to play, so a
+        # still-idle session is never nagged on a loop.
+        cancel_reminder(conn, session_id)
+    conn.commit()
+    return delivered
+
+
 def process_once(
     conn: sqlite3.Connection,
     config: AgentVoiceConfig,
@@ -212,6 +400,12 @@ def process_once(
     if candidates_by_session:
         candidates = list(candidates_by_session.values())
         candidates.sort(key=lambda candidate: (candidate.priority, candidate.created_at))
+
+        # Schedule a timed idle reminder for every session now waiting on the user.
+        # Skipped for no-deliver runs (e.g. the update health probe) so synthetic
+        # events do not leave a spurious reminder behind.
+        if deliver:
+            _schedule_idle_reminders(conn, config, candidates, current_time)
 
         voice_allowed = config.voice_enabled
         desktop_allowed = config.desktop_enabled
@@ -594,6 +788,7 @@ def run_daemon(config: AgentVoiceConfig, *, once: bool = False, deliver: bool = 
             # looking alive on a perpetual failure.
             try:
                 process_once(conn, config, deliver=deliver, terminal_only=terminal_only)
+                deliver_due_reminders(conn, config, deliver=deliver, terminal_only=terminal_only)
                 run_maintenance(conn, config, current_time=now_ts())
                 write_heartbeat(config)
             except Exception as exc:  # noqa: BLE001 - keep the daemon alive

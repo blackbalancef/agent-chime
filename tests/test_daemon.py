@@ -4,8 +4,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_voice.config import AgentVoiceConfig, load_config, set_voice_config
-from agent_voice.daemon import in_quiet_hours, maybe_reload_config, process_once, run_maintenance
-from agent_voice.db import connect, init_db
+from agent_voice.daemon import (
+    _idle_reminder_delay_seconds,
+    build_idle_reminder_message,
+    deliver_due_reminders,
+    in_quiet_hours,
+    maybe_reload_config,
+    process_once,
+    run_maintenance,
+)
+from agent_voice.db import cancel_reminder, connect, due_reminders, init_db
 from agent_voice.delivery import DeliveryResult
 from agent_voice.intelligence.summarizer import SummaryResult
 from agent_voice.models import EventType, NormalizedEvent
@@ -298,8 +306,10 @@ class DaemonTests(unittest.TestCase):
             rows = conn.execute("SELECT message FROM notifications ORDER BY id").fetchall()
             self.assertEqual(len(rows), 2)
             reminder = rows[-1]["message"]
-            self.assertIn("reminder", reminder.lower())
-            self.assertIn("10 minutes", reminder)  # codex cache window
+            # Short reminder: "<project> is waiting for your reply." (no verbose
+            # cache-window phrasing), and it never leaks the assistant's message.
+            self.assertIn("waiting for your reply", reminder.lower())
+            self.assertIn("api", reminder)
             self.assertNotIn("full result I already produced", reminder)
             conn.close()
 
@@ -1182,6 +1192,99 @@ class DaemonPidFileTests(unittest.TestCase):
             self.assertEqual(seen_pid, [str(_os.getpid())])
             # Clean exit clears the pid file so the slot is not seen as a live daemon.
             self.assertFalse(pid_path.exists())
+
+
+class TimedIdleReminderTests(unittest.TestCase):
+    def _config(self, tmp: str, **overrides) -> AgentVoiceConfig:
+        return AgentVoiceConfig(
+            config_path=Path(tmp) / "config.toml",
+            database_path=f"{tmp}/events.sqlite3",
+            voice_backend="macos_say",
+            **overrides,
+        )
+
+    def _finish(self, conn, session_id="s1", project="api", agent="claude-code", *, current_time):
+        enqueue_event(
+            conn,
+            NormalizedEvent.build(
+                event_key=f"{session_id}-{current_time}",
+                agent_name=agent,
+                event_type=EventType.TASK_FINISHED,
+                project_name=project,
+                session_id=session_id,
+            ),
+        )
+        process_once(conn, self._cfg, deliver=True, terminal_only=True, current_time=current_time)
+
+    def test_delay_uses_cache_window_minus_margin(self) -> None:
+        cfg = AgentVoiceConfig(idle_reminder_margin_minutes=1)
+        self.assertEqual(_idle_reminder_delay_seconds(cfg, "claude-code"), 4 * 60)  # 5-1
+        self.assertEqual(_idle_reminder_delay_seconds(cfg, "codex"), 9 * 60)  # 10-1
+
+    def test_message_is_short_and_localized(self) -> None:
+        cfg_ru = AgentVoiceConfig(language="ru")
+        self.assertEqual(build_idle_reminder_message(cfg_ru, "claude-code", "api"), "api ждёт твоего ответа.")
+        cfg_en = AgentVoiceConfig(language="en")
+        self.assertEqual(build_idle_reminder_message(cfg_en, "claude-code", "api"), "api is waiting for your reply.")
+
+    def test_finish_schedules_reminder_that_fires_once_when_due(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._cfg = self._config(tmp)
+            conn = connect(self._cfg.database_path)
+            init_db(conn)
+            self._finish(conn, current_time=1000)
+
+            self.assertEqual(len(due_reminders(conn, 1100)), 0)  # not yet (needs +240)
+            self.assertEqual(len(due_reminders(conn, 1240)), 1)  # 4 min later
+
+            delivered = deliver_due_reminders(conn, self._cfg, current_time=1240, terminal_only=True)
+            self.assertEqual(delivered, 1)
+            self.assertEqual(len(due_reminders(conn, 999999)), 0)  # one-shot
+            msg = conn.execute("SELECT message FROM notifications ORDER BY id DESC LIMIT 1").fetchone()[0]
+            self.assertIn("waiting for your reply", msg)
+            conn.close()
+
+    def test_disabled_does_not_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._cfg = self._config(tmp, idle_reminder_enabled=False)
+            conn = connect(self._cfg.database_path)
+            init_db(conn)
+            self._finish(conn, current_time=1000)
+            self.assertEqual(len(due_reminders(conn, 999999)), 0)
+            conn.close()
+
+    def test_reply_cancels_reminder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._cfg = self._config(tmp)
+            conn = connect(self._cfg.database_path)
+            init_db(conn)
+            self._finish(conn, current_time=1000)
+            self.assertEqual(len(due_reminders(conn, 1240)), 1)
+            cancel_reminder(conn, "s1")  # user replied
+            self.assertEqual(len(due_reminders(conn, 1240)), 0)
+            conn.close()
+
+    def test_quiet_hours_suppresses_reminder_voice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Quiet window covering the whole day so the reminder is always inside it.
+            self._cfg = self._config(
+                tmp,
+                quiet_hours_enabled=True,
+                quiet_hours_from="00:00",
+                quiet_hours_to="23:59",
+                quiet_hours_voice=False,
+            )
+            conn = connect(self._cfg.database_path)
+            init_db(conn)
+            self._finish(conn, current_time=1000)
+            deliver_due_reminders(conn, self._cfg, current_time=1240)
+            row = conn.execute(
+                "SELECT spoken, audio_cost_usd FROM notifications ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            # Voice is silenced in quiet hours: the reminder is recorded but not spoken.
+            self.assertEqual(row["spoken"], 0)
+            self.assertEqual(row["audio_cost_usd"], 0)
+            conn.close()
 
 
 if __name__ == "__main__":

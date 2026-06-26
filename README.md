@@ -208,6 +208,8 @@ Run `voiccce config` with no flags to print the current configuration.
 | `--quiet-hours {on,off}` | Enable/disable the nightly quiet-hours window | `on` |
 | `--quiet-hours-from HH:MM` / `--quiet-hours-to HH:MM` | Quiet-hours window | `23:00` / `09:00` |
 | `--quiet-hours-voice {on,off}` / `--quiet-hours-desktop {on,off}` | Allow voice / desktop during quiet hours | voice off, desktop on |
+| `--idle-reminders {on,off}` | Speak a short "still waiting" nudge before the agent's prompt cache expires | `on` |
+| `--idle-reminder-margin MIN` | Minutes before cache expiry to nudge (Claude ~5 min window → fires at ~4) | `1` |
 | `--reset` / `--reset [--reset-section NAME]` | Reset the whole config (or one `[section]`) to defaults; a backup is written first | — |
 | `--list-backups` | List `config.toml.bak-*` backups, newest first | — |
 | `--restore [BACKUP]` | Restore from a backup (newest if omitted); the current file is backed up first | — |
@@ -220,6 +222,14 @@ to move the window (or `--quiet-hours-voice on` to keep speaking at night).
 
 Every config change writes a timestamped `config.toml.bak-*` backup; use
 `voiccce config --list-backups` and `voiccce config --restore` to roll back.
+
+**Idle reminders.** When a session finishes and you don't reply, Voiccce speaks
+one short nudge — *"<project> ждёт твоего ответа." / "<project> is waiting for
+your reply."* — timed to land just before the agent's prompt cache expires
+(Claude's ~5-minute window → fires at ~4 minutes, so a reply still hits a warm
+cache). It's one-shot per idle period and is cancelled the moment you reply.
+Turn it off with `voiccce config --idle-reminders off`, or change the lead time
+with `--idle-reminder-margin`.
 
 <details>
 <summary>OpenAI key and voice backend</summary>

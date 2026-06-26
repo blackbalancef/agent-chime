@@ -70,6 +70,33 @@ class UserPromptInterruptTests(unittest.TestCase):
             mock_stop = self._run_user_prompt(config_path, "sess-1")
             mock_stop.assert_not_called()
 
+    def test_reply_cancels_pending_reminder(self) -> None:
+        # A user reply must drop that session's pending idle reminder, even when
+        # interrupt-on-reply is off (nothing to interrupt, but still no nudge).
+        from agent_voice.db import connect, due_reminders, init_db, schedule_reminder
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            set_voice_config(config_path, interrupt_on_user_input=False)
+            config = load_config(config_path)
+            conn = connect(config.database_path)
+            init_db(conn)
+            schedule_reminder(
+                conn, session_id="sess-1", agent_name="claude-code",
+                project_name="api", due_at=10, created_at=0,
+            )
+            conn.commit()
+            conn.close()
+
+            self._run_user_prompt(config_path, "sess-1")
+
+            conn = connect(config.database_path)
+            try:
+                self.assertEqual(len(due_reminders(conn, 999999)), 0)
+            finally:
+                conn.close()
+
 
 class CliTests(unittest.TestCase):
     def test_install_claude_code_accepts_config_dir(self) -> None:
@@ -1714,6 +1741,15 @@ class ConfigSettersTests(unittest.TestCase):
             self.assertEqual(config.quiet_hours_from, "22:30")
             self.assertEqual(config.quiet_hours_to, "08:00")
             self.assertTrue(config.quiet_hours_voice)
+
+    def test_idle_reminder_toggle_and_margin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            out = self._run_config(config_path, "--idle-reminders", "off", "--idle-reminder-margin", "2")
+            config = load_config(config_path)
+            self.assertFalse(config.idle_reminder_enabled)
+            self.assertEqual(config.idle_reminder_margin_minutes, 2)
+            self.assertIn("Idle reminder: off", out)
 
     def test_quiet_hours_invalid_time_exits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

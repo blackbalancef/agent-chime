@@ -152,6 +152,12 @@ DEFAULT_QUIET_HOURS_CONFIG: dict[str, str | int | float | bool] = {
 DEFAULT_AUTOSTART_CONFIG: dict[str, str | int | float | bool] = {
     "managed": False,
 }
+DEFAULT_REMINDERS_CONFIG: dict[str, str | int | float | bool] = {
+    "enabled": True,
+    # Speak a short "still waiting" nudge this many minutes BEFORE the agent's
+    # prompt cache is expected to expire, so a reply still lands on a warm cache.
+    "margin_minutes": 1,
+}
 
 
 DEFAULT_CONFIG_TOML_TEMPLATE = """[meta]
@@ -202,7 +208,7 @@ completed = "Session {project} is fully complete."
 completed_with_summary = "Session {project} is fully complete. Summary: {summary}."
 handled = "Event in {project} was handled."
 test = "Voiccce is working."
-idle_reminder = "Just a reminder: {project} is done and waiting for your reply — within about {minutes} minutes, while {agent}'s cache is still warm."
+idle_reminder = "{project} is waiting for your reply."
 grouped_prefix = "Updates: {items}."
 grouped_many = "{count} sessions: {summary}."
 grouped_failed_fragment = "{project} failed"
@@ -221,7 +227,7 @@ completed = "Сессия {project} полностью завершена."
 completed_with_summary = "Сессия {project} полностью завершена. Итог: {summary}."
 handled = "Событие в проекте {project} обработано."
 test = "Voiccce работает."
-idle_reminder = "Напоминаю: {project} завершён и ждёт твоего ответа — примерно в течение {minutes} минут, пока кэш {agent} ещё тёплый."
+idle_reminder = "{project} ждёт твоего ответа."
 grouped_prefix = "Обновления: {items}."
 grouped_many = "Сессий: {count}. {summary}."
 grouped_failed_fragment = "{project} — ошибка"
@@ -288,6 +294,10 @@ desktop = true
 
 [autostart]
 managed = false
+
+[reminders]
+enabled = true
+margin_minutes = 1
 """
 
 DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
@@ -299,7 +309,7 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
         "completed_with_summary": "Session {project} is fully complete. Summary: {summary}.",
         "handled": "Event in {project} was handled.",
         "test": "Voiccce is working.",
-        "idle_reminder": "Just a reminder: {project} is done and waiting for your reply — within about {minutes} minutes, while {agent}'s cache is still warm.",
+        "idle_reminder": "{project} is waiting for your reply.",
         "grouped_prefix": "Updates: {items}.",
         "grouped_many": "{count} sessions: {summary}.",
         "grouped_failed_fragment": "{project} failed",
@@ -318,7 +328,7 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
         "completed_with_summary": "Сессия {project} полностью завершена. Итог: {summary}.",
         "handled": "Событие в проекте {project} обработано.",
         "test": "Voiccce работает.",
-        "idle_reminder": "Напоминаю: {project} завершён и ждёт твоего ответа — примерно в течение {minutes} минут, пока кэш {agent} ещё тёплый.",
+        "idle_reminder": "{project} ждёт твоего ответа.",
         "grouped_prefix": "Обновления: {items}.",
         "grouped_many": "Сессий: {count}. {summary}.",
         "grouped_failed_fragment": "{project} — ошибка",
@@ -392,6 +402,8 @@ class AgentVoiceConfig:
     quiet_hours_voice: bool = False
     quiet_hours_desktop: bool = True
     autostart_managed: bool = False
+    idle_reminder_enabled: bool = True
+    idle_reminder_margin_minutes: int = 1
 
 
 def expand_path(value: str | os.PathLike[str]) -> Path:
@@ -438,6 +450,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgentVoiceConfig:
     hotkey = data.get("hotkey", {})
     quiet_hours = data.get("quiet_hours", {})
     autostart = data.get("autostart", {})
+    reminders = data.get("reminders", {})
 
     voice_estimated_cost_per_minute_usd = float(
         voice.get("estimated_cost_per_minute_usd", DEFAULT_TTS_ESTIMATED_COST_PER_MINUTE_USD)
@@ -557,6 +570,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AgentVoiceConfig:
         quiet_hours_voice=bool(quiet_hours.get("voice", False)),
         quiet_hours_desktop=bool(quiet_hours.get("desktop", True)),
         autostart_managed=bool(autostart.get("managed", False)),
+        idle_reminder_enabled=bool(reminders.get("enabled", True)),
+        idle_reminder_margin_minutes=max(0, int(reminders.get("margin_minutes", 1))),
     )
 
 
@@ -934,6 +949,24 @@ def set_autostart_managed(path: str | os.PathLike[str] | None, managed: bool) ->
     return set_config_section_values(path, "autostart", {"managed": bool(managed)})
 
 
+def set_reminders_config(
+    path: str | os.PathLike[str] | None,
+    *,
+    enabled: bool | None = None,
+    margin_minutes: int | None = None,
+) -> Path:
+    """Update the [reminders] section (timed idle nudge)."""
+    values: dict[str, str | int | float | bool] = {}
+    if enabled is not None:
+        values["enabled"] = bool(enabled)
+    if margin_minutes is not None:
+        value = int(margin_minutes)
+        if value < 0:
+            raise ValueError("margin_minutes must be non-negative")
+        values["margin_minutes"] = value
+    return set_config_section_values(path, "reminders", values)
+
+
 def set_quiet_hours_config(
     path: str | os.PathLike[str] | None,
     *,
@@ -1247,6 +1280,7 @@ def _section_defaults(section: str) -> dict[str, str | int | float | bool] | Non
         "events": DEFAULT_EVENTS_CONFIG,
         "quiet_hours": DEFAULT_QUIET_HOURS_CONFIG,
         "autostart": DEFAULT_AUTOSTART_CONFIG,
+        "reminders": DEFAULT_REMINDERS_CONFIG,
     }
     defaults = registry.get(section)
     return dict(defaults) if defaults is not None else None
@@ -1262,6 +1296,7 @@ _MIGRATION_SECTIONS: tuple[str, ...] = (
     "events",
     "quiet_hours",
     "autostart",
+    "reminders",
 )
 
 

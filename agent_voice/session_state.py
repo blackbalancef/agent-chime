@@ -204,10 +204,7 @@ class SessionStateManager:
 
     def _build_reminder_message(self, event: NormalizedEvent) -> str:
         templates = self.message_templates.get(self.language, {})
-        template = templates.get("idle_reminder") or (
-            "Just a reminder: {project} is done and waiting for your reply — "
-            "within about {minutes} minutes, while {agent}'s cache is still warm."
-        )
+        template = templates.get("idle_reminder") or "{project} is waiting for your reply."
         agent_labels = {"claude-code": "Claude", "codex": "Codex", "pi": "Pi"}
         agent_label = agent_labels.get((event.agent_name or "").lower(), event.agent_name or "the agent")
         return template.format(
