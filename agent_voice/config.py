@@ -97,6 +97,7 @@ Project: {project}
 Agent: {agent}
 Status: {status}
 
+Always start the notification with the project name ({project}) so it is immediately clear which project this is about.
 Keep only what the user needs to know now. Write no more than {max_words} words, and always finish your sentence completely — never stop mid-thought or mid-word.
 Sound natural and varied, not like a status template. Do not mention internal paths, commands, or tests unless they are essential.
 Return only the text to speak.
@@ -104,6 +105,25 @@ Return only the text to speak.
 Final assistant update:
 {message}
 """
+
+# Older default prompts that predate a wording change. An existing config whose
+# [summary].prompt still equals one of these (verbatim) is upgraded to the current
+# DEFAULT_SUMMARY_PROMPT on load; a user's customized prompt is never touched.
+_STALE_SUMMARY_PROMPTS: tuple[str, ...] = (
+    """Rewrite the final assistant update into one natural spoken notification.
+Write the notification in {language_name}, regardless of the language of the update below — translate it if needed.
+Project: {project}
+Agent: {agent}
+Status: {status}
+
+Keep only what the user needs to know now. Write no more than {max_words} words, and always finish your sentence completely — never stop mid-thought or mid-word.
+Sound natural and varied, not like a status template. Do not mention internal paths, commands, or tests unless they are essential.
+Return only the text to speak.
+
+Final assistant update:
+{message}
+""",
+)
 DEFAULT_SUMMARY_CONFIG: dict[str, str | int | float | bool] = {
     "enabled": True,
     "provider": "openai",
@@ -192,6 +212,7 @@ Project: {project}
 Agent: {agent}
 Status: {status}
 
+Always start the notification with the project name ({project}) so it is immediately clear which project this is about.
 Keep only what the user needs to know now. Write no more than {max_words} words, and always finish your sentence completely — never stop mid-thought or mid-word.
 Sound natural and varied, not like a status template. Do not mention internal paths, commands, or tests unless they are essential.
 Return only the text to speak.
@@ -1309,21 +1330,32 @@ _STALE_IDLE_REMINDER_DEFAULTS: dict[str, str] = {
 }
 
 
-def _stale_message_upgrades(data: dict) -> dict[str, dict[str, str]]:
-    """Per-language message keys whose value equals a known old default and should
-    be replaced with the current bundled default."""
+def _stale_default_upgrades(data: dict) -> dict[str, dict[str, str]]:
+    """Section keys whose value equals a known OLD default and should be replaced
+    with the current bundled default. Custom values are never matched, so a user's
+    edits are preserved."""
     upgrades: dict[str, dict[str, str]] = {}
+
     messages = data.get("messages", {})
-    if not isinstance(messages, dict):
-        return upgrades
-    for lang, old_default in _STALE_IDLE_REMINDER_DEFAULTS.items():
-        lang_messages = messages.get(lang, {})
-        if not isinstance(lang_messages, dict):
-            continue
-        if lang_messages.get("idle_reminder") == old_default:
-            new_default = DEFAULT_MESSAGE_TEMPLATES.get(lang, {}).get("idle_reminder")
-            if new_default and new_default != old_default:
-                upgrades.setdefault(f"messages.{lang}", {})["idle_reminder"] = new_default
+    if isinstance(messages, dict):
+        for lang, old_default in _STALE_IDLE_REMINDER_DEFAULTS.items():
+            lang_messages = messages.get(lang, {})
+            if not isinstance(lang_messages, dict):
+                continue
+            if lang_messages.get("idle_reminder") == old_default:
+                new_default = DEFAULT_MESSAGE_TEMPLATES.get(lang, {}).get("idle_reminder")
+                if new_default and new_default != old_default:
+                    upgrades.setdefault(f"messages.{lang}", {})["idle_reminder"] = new_default
+
+    summary = data.get("summary", {})
+    if isinstance(summary, dict):
+        current_prompt = summary.get("prompt")
+        if isinstance(current_prompt, str):
+            normalized = current_prompt.strip()
+            is_stale = any(normalized == stale.strip() for stale in _STALE_SUMMARY_PROMPTS)
+            if is_stale and normalized != DEFAULT_SUMMARY_PROMPT.strip():
+                upgrades.setdefault("summary", {})["prompt"] = DEFAULT_SUMMARY_PROMPT
+
     return upgrades
 
 
@@ -1345,7 +1377,7 @@ def _migrate_config(config_path: Path, data: dict) -> dict:
         if missing:
             additions[section] = missing
 
-    upgrades = _stale_message_upgrades(data)
+    upgrades = _stale_default_upgrades(data)
 
     meta = data.get("meta", {})
     stored_version = meta.get("schema_version") if isinstance(meta, dict) else None

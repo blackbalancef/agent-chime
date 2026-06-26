@@ -22,6 +22,7 @@
 - Runtime voice controls: `stop-speaking`, `mute`, and `unmute`.
 
 ### Changed
+- AI summaries now start with the project name, so a spoken update makes it immediately clear which project it is about. The default summary prompt gained an explicit instruction; existing configs still carrying the previous default prompt are upgraded in place on load (a customized prompt is left untouched).
 - The menu bar now stays open after you change a setting. macOS dismisses a menu on any click, so after a toggle/selection (voice, engine, model, language, event toggles, idle reminder, integrations, hotkey) Voiccce re-opens the menu — letting you change several settings and run "Play test audio" without re-clicking the menu bar each time.
 - `voiccce update` is now a first-class command: it reports the version before and after, re-applies hooks for every wired agent, and runs a post-update health probe. With a local checkout it reinstalls from that source; with none (e.g. a non-editable pipx install) it self-fetches from `git+https://github.com/blackbalancef/voiccce@main`. New flags: `--source`, `--ref`, `--dev` (editable install), `--no-hooks`, `--no-probe`, `--no-restart`. This replaces the manual "git pull + pipx install --force" update story.
 - `voiccce config` now writes `config.toml` atomically and migrates older config files in place, so concurrent reads never see a half-written file.

@@ -484,6 +484,34 @@ class MigrationTests(unittest.TestCase):
             config = load_config(config_path)
             # A user's custom text (not the old default) is never touched.
             self.assertEqual(config.message_templates["ru"]["idle_reminder"], "мой текст {project}")
+
+    def test_migration_upgrades_stale_summary_prompt(self) -> None:
+        from agent_voice.config import (
+            DEFAULT_SUMMARY_PROMPT,
+            _STALE_SUMMARY_PROMPTS,
+            set_config_section_values,
+            write_default_config,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            set_config_section_values(config_path, "summary", {"prompt": _STALE_SUMMARY_PROMPTS[0]})
+
+            config = load_config(config_path)
+            self.assertEqual(config.summary_prompt.strip(), DEFAULT_SUMMARY_PROMPT.strip())
+            self.assertIn("Always start the notification with the project name", config.summary_prompt)
+
+    def test_migration_keeps_custom_summary_prompt(self) -> None:
+        from agent_voice.config import set_config_section_values, write_default_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            write_default_config(config_path)
+            set_config_section_values(config_path, "summary", {"prompt": "My custom prompt {message}"})
+
+            config = load_config(config_path)
+            self.assertEqual(config.summary_prompt, "My custom prompt {message}")
             self.assertEqual(config.daily_spend_cap_usd, 0.0)
 
 
