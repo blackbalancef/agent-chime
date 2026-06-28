@@ -165,6 +165,12 @@ VOICE_SPEED_BUTTON_GAP = 8.0
 VOICE_SPEED_PRESETS = (1.0, 1.5, 2.0)
 # Slider value is carried on preset buttons via setTag_ (int), scaled by this factor.
 VOICE_SPEED_TAG_SCALE = 100
+# A view-based on/off row: a switch control inside a menu item's custom view
+# toggles live without dismissing the menu, the way the speed slider does. A
+# classic checkmark item closes the menu on click, which read as a flicker.
+TOGGLE_ROW_HEIGHT = 22.0
+TOGGLE_ROW_INSET = 18.0
+NS_SWITCH_BUTTON_TYPE = 3  # NSButtonTypeSwitch (a checkbox)
 # Raw NSEventType values; constant across AppKit and available without Cocoa.
 LEFT_MOUSE_DOWN_EVENT_TYPE = 1
 LEFT_MOUSE_DRAGGED_EVENT_TYPE = 6
@@ -555,26 +561,27 @@ class AgentVoiceMenuBar(NSObject):
             )
         )
 
-        reminder_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Idle reply reminder", "toggleIdleReminder:", ""
+        menu.addItem_(
+            self._toggle_item(
+                "Idle reply reminder",
+                config.idle_reminder_enabled,
+                "toggleIdleReminder:",
+            )
         )
-        reminder_item.setTarget_(self)
-        reminder_item.setState_(1 if config.idle_reminder_enabled else 0)
-        menu.addItem_(reminder_item)
-
-        interrupt_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Stop audio when I reply", "toggleInterruptOnReply:", ""
+        menu.addItem_(
+            self._toggle_item(
+                "Stop audio when I reply",
+                config.voice_interrupt_on_user_input,
+                "toggleInterruptOnReply:",
+            )
         )
-        interrupt_item.setTarget_(self)
-        interrupt_item.setState_(1 if config.voice_interrupt_on_user_input else 0)
-        menu.addItem_(interrupt_item)
-
-        mic_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Pause voice while mic is active", "togglePauseWhenMicActive:", ""
+        menu.addItem_(
+            self._toggle_item(
+                "Pause voice while mic is active",
+                config.suppress_when_mic_active,
+                "togglePauseWhenMicActive:",
+            )
         )
-        mic_item.setTarget_(self)
-        mic_item.setState_(1 if config.suppress_when_mic_active else 0)
-        menu.addItem_(mic_item)
 
     @_python_method
     def _add_announce_events_submenu(self, menu: object, config) -> None:
@@ -764,6 +771,42 @@ class AgentVoiceMenuBar(NSObject):
             if cell is not None:
                 cell.setControlSize_(1)  # NSControlSizeSmall
             view.addSubview_(button)
+
+    @_python_method
+    def _toggle_item(self, title: str, is_on: bool, action: str) -> object:
+        """An on/off row that toggles in place without closing the menu.
+
+        A classic checkmark NSMenuItem dismisses the menu on click, so revealing
+        the new state needed a jarring close-then-reopen. A control hosted in a
+        menu item's custom view does not dismiss the menu — the same trick the
+        speed slider relies on — so the toggle applies live and the menu stays put.
+        """
+        classic = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+        classic.setTarget_(self)
+        classic.setState_(1 if is_on else 0)
+        if NSView is None or NSButton is None:
+            return classic
+
+        button = NSButton.alloc().init()
+        button.setButtonType_(NS_SWITCH_BUTTON_TYPE)
+        button.setTitle_(title)
+        button.setState_(1 if is_on else 0)
+        button.setTarget_(self)
+        button.setAction_(action)
+        if NSFont is not None:
+            button.setFont_(NSFont.menuFontOfSize_(0.0))
+        # Size the row to the toggle's natural width so it never forces the menu
+        # wider than its text needs.
+        button.sizeToFit()
+        size = button.frame().size
+        row_width = TOGGLE_ROW_INSET + size.width + TOGGLE_ROW_INSET
+        view = NSView.alloc().initWithFrame_(((0.0, 0.0), (row_width, TOGGLE_ROW_HEIGHT)))
+        button.setFrameOrigin_((TOGGLE_ROW_INSET, (TOGGLE_ROW_HEIGHT - size.height) / 2.0))
+        view.addSubview_(button)
+
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+        item.setView_(view)
+        return item
 
     @_python_method
     def _read_last_voice_channel(self, config) -> str | None:
@@ -1264,8 +1307,7 @@ class AgentVoiceMenuBar(NSObject):
         set_reminders_config(config.config_path, enabled=new_value)
         self._restart_daemon_if_running()
         self._log(f"Idle reply reminder {'enabled' if new_value else 'disabled'}")
-        self.refresh()
-        self._keep_menu_open()
+        # The view-based switch toggles in place — the menu stays open, no reopen.
 
     def toggleInterruptOnReply_(self, sender) -> None:
         config = self._config()
@@ -1273,8 +1315,7 @@ class AgentVoiceMenuBar(NSObject):
         set_voice_config(config.config_path, interrupt_on_user_input=new_value)
         # Read fresh by the hook on each invocation — no daemon restart needed.
         self._log(f"Stop-audio-on-reply {'enabled' if new_value else 'disabled'}")
-        self.refresh()
-        self._keep_menu_open()
+        # The view-based switch toggles in place — the menu stays open, no reopen.
 
     def togglePauseWhenMicActive_(self, sender) -> None:
         config = self._config()
@@ -1282,8 +1323,7 @@ class AgentVoiceMenuBar(NSObject):
         set_voice_config(config.config_path, suppress_when_mic_active=new_value)
         # The daemon reloads config each poll cycle, so no restart is needed.
         self._log(f"Pause-voice-while-mic-active {'enabled' if new_value else 'disabled'}")
-        self.refresh()
-        self._keep_menu_open()
+        # The view-based switch toggles in place — the menu stays open, no reopen.
 
     @_python_method
     def _restart_daemon_if_running(self) -> None:

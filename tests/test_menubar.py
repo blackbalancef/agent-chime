@@ -584,8 +584,9 @@ class CliMenuParityTests(unittest.TestCase):
             controller.toggleIdleReminder_(SimpleNamespace())
             self.assertFalse(load_config(config_path).idle_reminder_enabled)
             controller._restart_daemon_if_running.assert_called_once()
-            # The menu is re-opened so several settings can be changed in a row.
-            controller._keep_menu_open.assert_called_once()
+            # It is a view-based switch now: it toggles in place, so the handler
+            # must NOT trigger the close-then-reopen that classic items needed.
+            controller._keep_menu_open.assert_not_called()
             # Toggling again re-enables it.
             controller.toggleIdleReminder_(SimpleNamespace())
             self.assertTrue(load_config(config_path).idle_reminder_enabled)
@@ -599,7 +600,8 @@ class CliMenuParityTests(unittest.TestCase):
             self.assertTrue(load_config(config_path).suppress_when_mic_active)
             # The daemon reloads config each poll cycle, so no restart is needed.
             controller._restart_daemon_if_running.assert_not_called()
-            controller._keep_menu_open.assert_called_once()
+            # View-based switch: toggles in place, no jarring close-then-reopen.
+            controller._keep_menu_open.assert_not_called()
             # Toggling again disables it.
             controller.togglePauseWhenMicActive_(SimpleNamespace())
             self.assertFalse(load_config(config_path).suppress_when_mic_active)
